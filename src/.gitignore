@@ -3,6 +3,9 @@
 # Ignore 
 comment_directory/
 
+# Ignore archived original source copies
+Original_*/
+
 build/*
 
 # Keep this directory in the repo

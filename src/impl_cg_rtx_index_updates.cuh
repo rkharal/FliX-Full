@@ -25,6 +25,7 @@
 // #include "coarse_granular_lookups.cuh"
 #include "coarse_granular_lookups_tile.cuh"
 #include "coarse_granular_lookups_tile_bulk.cuh"
+#include "coarse_granular_range_queries.cuh"
 // #include "coarse_granular_lookups_tile.cuh"
 
 #include "coarse_granular_combined_updates.cuh"
@@ -1443,6 +1444,7 @@ private:
     cuda_buffer<smallsize> reuse_list_buffer;
 
     cuda_buffer<smallsize> bucket_values_buffer;
+    cuda_buffer<smallsize> range_query_sums_buffer;
 
     // add a buffer for static tree
     //  Meta data
@@ -2638,7 +2640,38 @@ public:
 
     void range_lookup_sum(const key_type *lower, const key_type *upper, smallsize *result, size_t size, cudaStream_t stream)
     {
+        if (size == 0)
+            return;
 
+        smallsize total_threads_required = partition_count_with_overflow * TILE_SIZE; // NOT divided by anything
+                                                                                      // smallsize maxblocksplus1 = SDIV(blocksPerGrid, MAXBLOCKSIZE /DIV_FACTOR) + 1;
+        smallsize max_blocks_required = SDIV(total_threads_required, MAXBLOCKSIZE /DIV_FACTOR);
+
+        if (range_query_sums_buffer.num_elements != partition_count_with_overflow)
+        {
+            range_query_sums_buffer.resize(partition_count_with_overflow);
+        }
+        
+        precompute_bucket_offset_sums_kernel<key_type>
+        <<<max_blocks_required, MAXBLOCKSIZE / DIV_FACTOR, 0, stream>>>(
+            launch_params_buffer.ptr(),
+            range_query_sums_buffer.ptr()); //lookup_kernel_tile_ordered<key_type><<<max_blocks_required, MAXBLOCKSIZE /DIV_FACTOR, 0, stream>>>(launch_params_buffer.ptr(), lower, result, size);
+        smallsize range_threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
+        smallsize range_blocks_required = SDIV(size, range_threads_per_block);
+
+        printf("RANGE QUERIES LOOKUP SUM TILE ORDERED:  div is:%d,  bucket_blocks=%d range_blocks=%d and threads/block %d \n",
+               DIV_FACTOR,
+               max_blocks_required,
+               range_blocks_required,
+               range_threads_per_block);
+        lookup_kernel_tile_ordered_rq_sums<key_type><<<range_blocks_required, range_threads_per_block, 0, stream>>>(
+            launch_params_buffer.ptr(),
+            lower,
+            upper,
+            range_query_sums_buffer.ptr(),
+            result,
+            size);
+   
         // todo
     }
 
@@ -2686,10 +2719,13 @@ public:
         copy_buffer.free();
         tree_buffer.free();
         bucket_values_buffer.free();
+        range_query_sums_buffer.free();
         // copy_update_list.free();
         // copy_offset_list.free();
     }
 };
+
+
 
 #endif
 

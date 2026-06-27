@@ -118,6 +118,40 @@ DEVICEQUALIFIER int binarySearchIndex_leftmost_ge(
     return (lo < right) ? lo : -1;
 }
 
+template <typename Key>
+DEVICEQUALIFIER int binarySearchIndex_leftmost_ge_strict(
+    const Key* __restrict__ array,
+    Key key,
+    int left,
+    int right /* half-open: [left, right) */)
+{
+    if (!array) return -1;
+    if (right <= left) return -1;
+    if (left < 0) left = 0;
+    if (right < 0) return -1;
+
+    int lo = left;
+    int hi = right;
+    while (lo < hi)
+    {
+        const int mid = lo + (hi - lo) / 2;
+        if (array[mid] < key)
+        {
+            lo = mid + 1;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+
+    if (lo >= right)
+    {
+        return -1;
+    }
+    return (array[lo] >= key) ? lo : -1;
+}
+
 
 
 template <typename key_type>

@@ -541,7 +541,11 @@ GLOBALQUALIFIER void lsm_naive_range_lookup_kernel(
             if (staged_keys[staged_offset] > upper_bound)
                 break;
             if (staged_keys[staged_offset] >= lower_bound)
-                result += staged_values[staged_offset];
+            {
+                const auto value = staged_values[staged_offset];
+                if (value != not_found)
+                    result += value;
+            }
         }
     }
 
@@ -563,7 +567,11 @@ GLOBALQUALIFIER void lsm_naive_range_lookup_kernel(
             if (current_level_keys[final_offset] > upper_bound)
                 break;
             if (current_level_keys[final_offset] >= lower_bound)
-                result += level_values[offset + final_offset];
+            {
+                const auto value = level_values[offset + final_offset];
+                if (value != not_found)
+                    result += value;
+            }
         }
     }
 
@@ -600,7 +608,7 @@ GLOBALQUALIFIER void lsm_collaborative_range_lookup_kernel(
     key_type lower_limit;
     key_type upper_limit;
     smallsize offset;
-    smallsize result;
+    smallsize result = 0;
     bool to_find = false;
 
     if (tid < size)
@@ -621,7 +629,28 @@ GLOBALQUALIFIER void lsm_collaborative_range_lookup_kernel(
         const auto local_lower = tile.shfl(lower_limit, local_id);
         const auto local_upper = tile.shfl(upper_limit, local_id);
         const auto local_offset = tile.shfl(offset, local_id);
-        const auto local_result = mem::rq(mem::col_store<key_type, smallsize, smallsize>(sorted_keys, sorted_values, sorted_size)).cooperative_range_query(tile, local_lower, local_upper, local_offset);
+        smallsize local_agg = 0;
+        for (smallsize scan_offset = local_offset + tile.thread_rank();; scan_offset += tile.size())
+        {
+            const bool is_valid = scan_offset < sorted_size;
+            const auto key = is_valid ? sorted_keys[scan_offset] : key_type{};
+            const bool overstepped = !is_valid || key > local_upper;
+
+            if (!overstepped && key >= local_lower)
+            {
+                const auto value = sorted_values[scan_offset];
+                if (value != not_found)
+                    local_agg += value;
+            }
+
+            if (tile.any(overstepped))
+                break;
+        }
+
+        const auto local_result = cooperative_groups::reduce(
+            tile,
+            local_agg,
+            cooperative_groups::plus<smallsize>());
 
         if (local_id == tile.thread_rank())
         {
@@ -633,7 +662,7 @@ GLOBALQUALIFIER void lsm_collaborative_range_lookup_kernel(
 
     if (tid < size)
     {
-        results[tid] = result;
+        results[tid] += result;
     }
 }
 

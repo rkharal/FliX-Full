@@ -108,8 +108,15 @@ inline constexpr smallsize lsm_tree = 0;
 //////-------------------------
 
 
+
+#ifdef RQ_SIZE
+constexpr smallsize RANGE_QUERY_SIZE = 1<<RQ_SIZE;
+#else
+constexpr smallsize RANGE_QUERY_SIZE = 1<<8; //256;
+#endif
+
 #ifdef DIV
-constexpr smallsize DIV_FACTOR = DIV;
+constexpr smallsize DIV_FACTOR = static_cast<smallsize>(DIV);
 #else
 constexpr smallsize DIV_FACTOR = 8;
 #endif
@@ -146,15 +153,27 @@ constexpr bool ST_Delete_Tombstones = false;
 #endif
 
 #ifdef XVAL
-constexpr size_t percentage_distribution_dense_keys = XVAL; // defaults to 50%
+constexpr double percentage_distribution_dense_keys = XVAL; // defaults to 50%
 #else
-constexpr size_t percentage_distribution_dense_keys = 25; // defaults to 50%
+constexpr double percentage_distribution_dense_keys = 25; // defaults to 50%
 #endif
 
 #ifdef YVAL
 constexpr size_t percentage_new_keys_from_dense_region = YVAL; // defaults to 90%
 #else
 constexpr size_t percentage_new_keys_from_dense_region = 90; // defaults to 90%
+#endif
+
+#ifdef PD
+constexpr size_t probes_dense_percent = PD;
+#else
+constexpr size_t probes_dense_percent = 95;
+#endif
+
+#ifdef PU
+constexpr size_t probes_uniform_percent = PU;
+#else
+constexpr size_t probes_uniform_percent = 5;
 #endif
 
 #ifdef MIN_KEYS_INSERT

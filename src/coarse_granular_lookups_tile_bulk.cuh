@@ -582,7 +582,15 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered(
     if (lane == 0)
     {
 
+        /*
+        OLD lower-bound helper:
         minindex = binarySearchIndex_leftmost_ge<key_type>(query_list, minkey, 0, query_size);
+
+        The old helper can return the final query index when minkey is larger
+        than every query key. That lets the empty overflow bucket process and
+        overwrite the final query result with not_found.
+        */
+        minindex = binarySearchIndex_leftmost_ge_strict<key_type>(query_list, minkey, 0, query_size);
         // maxindex: last position <= maxkey
         // maxindex = binarySearchIndex_first_gt_leftmost_dup<key_type>(query_list, maxkey, 0, query_size);
     }
@@ -603,8 +611,6 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered(
         static_cast<uint8_t *>(launch_params->ordered_node_pairs) +
         static_cast<size_t>(launch_params->node_stride) * static_cast<size_t>(tile_id);
 
-  
-
     process_lookup_tile_bulk_ordered_dup<key_type>(
         // process_lookup_tile_bulk_ordered<key_type>(
 
@@ -620,10 +626,6 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered(
 
     // if (lane ==0) printf("END LOOKUP TILE BULK ORDERED: tile_id=%d DONE\n", tile_id);
 }
-
-
-
-
 
 // Assumes: not_found, TILE_SIZE, cg::extract/set, extract_key_node, extract_offset_node, get_lastposition_bytes
 template <typename key_type>

@@ -36,7 +36,8 @@
 //#define REBUILD_ON
 // #define COMBINE_INSERT_DELETE
 // #define COMPUTE_TOTALKEYS
-
+#define SKIP_RANGE_QUERIES 1
+constexpr bool ENABLE_DUMMY_INSERTS = false;
 #ifdef REBUILD_INTERVAL
 constexpr smallsize rebuild_frequency = REBUILD_INTERVAL; // every round;
 #else
@@ -75,6 +76,32 @@ constexpr bool shift_insert_range = false;
 #include <cstdlib>
 #include <iostream>
 #include <vector>
+
+template <typename key_type>
+std::vector<key_type> make_range_upper_keys(const std::vector<key_type> &lower_keys)
+{
+    std::vector<key_type> upper_keys;
+    upper_keys.reserve(lower_keys.size());
+
+    const key_type upper_cap =
+        static_cast<key_type>(max_usable_key<key_type>() - static_cast<key_type>(2));
+    const key_type range_delta = static_cast<key_type>(RANGE_QUERY_SIZE);
+    const key_type last_safe_lower =
+        (upper_cap > range_delta)
+            ? static_cast<key_type>(upper_cap - range_delta)
+            : key_type(0);
+
+    for (const key_type lower : lower_keys)
+    {
+        const key_type upper =
+            (lower > upper_cap || lower > last_safe_lower)
+                ? upper_cap
+                : static_cast<key_type>(lower + range_delta);
+        upper_keys.push_back(upper);
+    }
+
+    return upper_keys;
+}
 
 /**
  * Checks successor/ceiling results:
@@ -213,6 +240,15 @@ GLOBALQUALIFIER void fill_seq_u32_kernel(uint32_t *out, size_t n)
         out[i] = static_cast<uint32_t>(i);
 }
 
+template <typename T>
+void ensure_cuda_buffer_elements(cuda_buffer<T> &buffer, size_t required_elements)
+{
+    if (buffer.num_elements < required_elements)
+    {
+        buffer.resize(required_elements);
+    }
+}
+
 template <typename key_t>
 void key_only_sort_device_timed2(const cuda_buffer<key_t> &d_keys_in,
                                  size_t n,
@@ -230,8 +266,10 @@ void key_only_sort_device_timed2(const cuda_buffer<key_t> &d_keys_in,
 
     // d_perm_in.alloc(n);
 
-    d_sorted_keys.alloc(n * sizeof(key_t));
-    d_perm_sorted.alloc(n * sizeof(uint32_t));
+    // OLD: d_sorted_keys.alloc(n * sizeof(key_t));
+    // OLD: d_perm_sorted.alloc(n * sizeof(uint32_t));
+    ensure_cuda_buffer_elements(d_sorted_keys, n);
+    ensure_cuda_buffer_elements(d_perm_sorted, n);
     d_perm_in.alloc(n * sizeof(uint32_t));
 
     if (n == 0)
@@ -246,7 +284,7 @@ void key_only_sort_device_timed2(const cuda_buffer<key_t> &d_keys_in,
     // Scratch size for CUB SortPairs (no power-of-2 requirement).
     const size_t aux_needed = find_pair_sort_buffer_size3<key_t, uint32_t>(n);
     if (d_aux.size_in_bytes() < aux_needed)
-        d_aux.alloc(aux_needed);
+        d_aux.resize(aux_needed);
 
     printf("GPU ----> sorting function key_only_sort_device_timed: aux_needed=%zu bytes for n=%zu\n", aux_needed, n);
 
@@ -267,8 +305,10 @@ void key_only_sort_device_timed(const cuda_buffer<key_t> &d_keys_in,
                                 double *sort_time_ms,                 // OUT: ms
                                 cudaStream_t stream)
 {
-    d_sorted_keys.alloc(n);
-    d_perm_sorted.alloc(n);
+    // OLD: d_sorted_keys.alloc(n);
+    // OLD: d_perm_sorted.alloc(n);
+    ensure_cuda_buffer_elements(d_sorted_keys, n);
+    ensure_cuda_buffer_elements(d_perm_sorted, n);
 
     // Build initial permutation 0..n-1
     cuda_buffer<uint32_t> d_perm_in;
@@ -281,7 +321,7 @@ void key_only_sort_device_timed(const cuda_buffer<key_t> &d_keys_in,
     const size_t aux_needed = find_pair_sort_buffer_size<key_t, uint32_t>(n);
     if (d_aux.size_in_bytes() < aux_needed)
     {
-        d_aux.alloc(aux_needed); // assume alloc() re-allocs if needed
+        d_aux.resize(aux_needed);
     }
 
     // Timed pairs sort: (key, idx) -> (sorted_key, perm_sorted)
@@ -309,7 +349,8 @@ void scatter_sorted_to_original(const cuda_buffer<T> &d_vals_sorted,
                                 cuda_buffer<T> &d_out_original,
                                 size_t n, cudaStream_t stream)
 {
-    d_out_original.alloc(n);
+    // OLD: d_out_original.alloc(n);
+    ensure_cuda_buffer_elements(d_out_original, n);
     const int TPB = 256;
     const int GRD = static_cast<int>((n + TPB - 1) / TPB);
     scatter_perm_kernel<<<GRD, TPB, 0, stream>>>(
@@ -521,10 +562,13 @@ void key_only_sort_device_timed_debug(const cuda_buffer<key_t>& d_keys_in,
     if (sort_time_ms) *sort_time_ms = 0.0;
     if (n == 0) return;
 
-    // Grow-only reuse
-    d_sorted_keys.alloc(n);
-    d_perm_sorted.alloc(n);
-    d_perm_in.alloc(n);
+    // Grow-only reuse.
+    // OLD: d_sorted_keys.alloc(n);
+    // OLD: d_perm_sorted.alloc(n);
+    // OLD: d_perm_in.alloc(n);
+    ensure_cuda_buffer_elements(d_sorted_keys, n);
+    ensure_cuda_buffer_elements(d_perm_sorted, n);
+    ensure_cuda_buffer_elements(d_perm_in, n);
 
     // Catch alloc failures early (OOM will show up here, not at kernel launch)
     CUCHECK(cudaGetLastError());
@@ -539,7 +583,7 @@ void key_only_sort_device_timed_debug(const cuda_buffer<key_t>& d_keys_in,
 
     const size_t aux_needed = find_pair_sort_buffer_size<key_t, uint32_t>(n);
     if (d_aux.size_in_bytes() < aux_needed) {
-        d_aux.alloc(aux_needed);
+        d_aux.resize(aux_needed);
     }
 
     CUCHECK(cudaGetLastError());
@@ -731,7 +775,7 @@ void generate_keys_hybrid_dense_file(
     key_type max_usable_key,
     std::vector<key_type> &generated_keys,
     bool shift_dense_keys = false, // Set to true to generate dense keys
-    size_t percentage_distribution_dense_keys = 10,
+    double percentage_distribution_dense_keys = 10,
     size_t percentage_new_keys_from_dense_region = 75, // defaults to 75
     const std::string &filename = "keys_cache.txt"
 
@@ -1169,7 +1213,7 @@ void benchmark_updates(
     {
         const auto &tc = test_configuration_options[tci];
 
-        rti_assert(tc.probe_size_log >= tc.build_size_log);
+        //rti_assert(tc.probe_size_log >= tc.build_size_log);
 
         /* 
         // -------------- TEMPORARAY MANUAL OVERRIDE FOR TESTING: BUILD_SIZE and PROBE_SIZE
@@ -1281,7 +1325,7 @@ void benchmark_updates(
         // Generate input keys
         std::vector<key_type> generated_keys;
         bool rotate_dense_key_range = false; // Set to true to generate dense keys
-                                             // size_t percentage_distribution_dense_keys = 25; // defaults to 50%
+                                             // double percentage_distribution_dense_keys = 25; // defaults to 50%
                                              // size_t percentage_new_keys_from_dense_region = 90; // defaults to 90%
         generate_keys_hybrid_dense_file2_shifted<key_type>(
             key_generation_size, // Total number of keys
@@ -1433,6 +1477,7 @@ void benchmark_updates(
 
                 double insert_or_delete_time_ms = 0;
                 double probe_time_ms = 0;
+                double range_query_time_ms = 0;
                 double successor_hits_probe_time_ms = 0;
                 double successor_misses_probe_time_ms = 0;
 
@@ -1495,7 +1540,7 @@ void benchmark_updates(
                 if constexpr (supports_updates)
                 {
                     // Warm up the kernels with a dummy insert to ensure fair timing for the first real update batch
-                    if (step == 1 )  
+                    if (ENABLE_DUMMY_INSERTS && step == 1 )  
                     {
                         std::cerr << "Performing Dummy Insert Round\n";
                         size_t dummy_insert_size = 10; // 2000;
@@ -1682,23 +1727,35 @@ void benchmark_updates(
                 // NEW FOR CHECKING DELS-- ADD THIS BLOCK at ---->>> HERE (right before adjusting active_range_*) ---
                 if constexpr (supports_updates)
                 {
-                    if (did_delete_this_step && !last_deleted_keys.empty())
-                    {
-                        const smallsize del_probe_size = static_cast<smallsize>(last_deleted_keys.size());
-                        // std::cerr << "    --TEST Post-Delete Miss-Probe for " << del_probe_size << " keys..." << std::endl;
-                        // Upload deleted keys as probes
-                        probe_keys_buffer.upload(last_deleted_keys.data(), del_probe_size);
+	                    if (did_delete_this_step && !last_deleted_keys.empty())
+	                    {
+	                        const smallsize del_probe_size = static_cast<smallsize>(last_deleted_keys.size());
+	                        // std::cerr << "    --TEST Post-Delete Miss-Probe for " << del_probe_size << " keys..." << std::endl;
+	                        /*
+	                        OLD post-delete miss-probe buffers:
+	                        These reused probe_keys_buffer and result_buffer, which are only
+	                        allocated to the regular probe_size. At larger build sizes,
+	                        delete_batch_size can exceed probe_size and overflow those buffers.
 
-                        // Initialize results to MISS sentinel (=2), consistent with your miss2 checks
-                        {
-                            std::vector<smallsize> init_miss_results(del_probe_size, static_cast<smallsize>(2));
-                            result_buffer.upload(init_miss_results.data(), del_probe_size);
-                        }
+	                        // Upload deleted keys as probes
+	                        probe_keys_buffer.upload(last_deleted_keys.data(), del_probe_size);
 
-                        // Sort probes + lookup + scatter back
-                        static cuda_buffer<key_type> d_del_sorted_keys;
-                        static cuda_buffer<uint32_t> d_del_perm_sorted;
-                        static cuda_buffer<uint8_t> d_del_aux;
+	                        // Initialize results to MISS sentinel (=2), consistent with your miss2 checks
+	                        {
+	                            std::vector<smallsize> init_miss_results(del_probe_size, static_cast<smallsize>(2));
+	                            result_buffer.upload(init_miss_results.data(), del_probe_size);
+	                        }
+	                        */
+
+		                        cuda_buffer<key_type> del_probe_keys_buffer;
+		                        cuda_buffer<smallsize> del_result_buffer;
+		                        del_probe_keys_buffer.alloc(del_probe_size);
+		                        del_probe_keys_buffer.upload(last_deleted_keys.data(), del_probe_size);
+
+	                        // Sort probes + lookup + scatter back
+	                        static cuda_buffer<key_type> d_del_sorted_keys;
+	                        static cuda_buffer<uint32_t> d_del_perm_sorted;
+	                        static cuda_buffer<uint8_t> d_del_aux;
                         cuda_buffer<smallsize> tmp_results_sorted;
 
                         tmp_results_sorted.alloc(del_probe_size);
@@ -1707,13 +1764,13 @@ void benchmark_updates(
                             tmp_results_sorted.upload(init_miss_results.data(), del_probe_size);
                         }
 
-                        double del_sort_time_ms = 0.0;
-                        key_only_sort_device_timed<key_type>(
-                            probe_keys_buffer,
-                            del_probe_size,
-                            d_del_sorted_keys,
-                            d_del_perm_sorted,
-                            d_del_aux,
+	                        double del_sort_time_ms = 0.0;
+	                        key_only_sort_device_timed<key_type>(
+	                            del_probe_keys_buffer,
+	                            del_probe_size,
+	                            d_del_sorted_keys,
+	                            d_del_perm_sorted,
+	                            d_del_aux,
                             &del_sort_time_ms,
                             0 // stream
                         );
@@ -1737,16 +1794,16 @@ void benchmark_updates(
                         cudaDeviceSynchronize();
                         C2EX
 
-                            scatter_sorted_to_original<smallsize>(
-                                tmp_results_sorted,
-                                d_del_perm_sorted,
-                                result_buffer,
-                                del_probe_size, 0);
+	                            scatter_sorted_to_original<smallsize>(
+	                                tmp_results_sorted,
+	                                d_del_perm_sorted,
+	                                del_result_buffer,
+	                                del_probe_size, 0);
 
                         cudaDeviceSynchronize();
                         C2EX
 
-                            auto del_probe_result = result_buffer.download(del_probe_size);
+	                            auto del_probe_result = del_result_buffer.download(del_probe_size);
 
                         cudaDeviceSynchronize();
                         C2EX
@@ -1924,6 +1981,7 @@ void benchmark_updates(
                             index.lookups_ordered(d_sorted_keys.ptr(),
                                                   tmp_results_sorted.ptr(),
                                                   20, 0);
+                            // timer.stop();
 
                             // timer.start();
                         }
@@ -1959,6 +2017,78 @@ void benchmark_updates(
                             std::cerr << " -> SKIP " << error_message << std::endl;
                             break;
                         }
+
+#ifndef SKIP_RANGE_QUERIES
+                        {
+                            static cuda_buffer<key_type> d_range_upper_keys;
+                            static cuda_buffer<smallsize> tmp_range_results_sorted;
+
+                            if (d_range_upper_keys.num_elements != probe_size)
+                            {
+                                d_range_upper_keys.resize(probe_size);
+                            }
+                            if (tmp_range_results_sorted.num_elements != probe_size)
+                            {
+                                tmp_range_results_sorted.resize(probe_size);
+                            }
+
+                            const key_type *range_lower_device = nullptr;
+                            std::vector<key_type> range_lower_host;
+
+#if !defined(UNSORTED_PROBES_CHECKS)
+                            range_lower_device = d_sorted_keys.ptr();
+                            range_lower_host = d_sorted_keys.download(probe_size);
+#else
+                            range_lower_device = probe_keys_buffer.ptr();
+                            range_lower_host = probe_keys;
+#endif
+
+                            const auto range_upper_host =
+                                make_range_upper_keys<key_type>(range_lower_host);
+
+                            d_range_upper_keys.upload(range_upper_host.data(), probe_size);
+                            tmp_range_results_sorted.zero();
+
+                            const size_t warmup_size = std::min<size_t>(20, probe_size);
+                            if (step == 0 && warmup_size > 0)
+                            {
+                                index.range_lookup_sum(
+                                    range_lower_device,
+                                    d_range_upper_keys.ptr(),
+                                    tmp_range_results_sorted.ptr(),
+                                    warmup_size,
+                                    0);
+                            }
+
+                            tmp_range_results_sorted.zero();
+                            timer.start();
+                            index.range_lookup_sum(
+                                range_lower_device,
+                                d_range_upper_keys.ptr(),
+                                tmp_range_results_sorted.ptr(),
+                                probe_size,
+                                0);
+                            timer.stop();
+                            range_query_time_ms = timer.time_ms();
+                            cudaDeviceSynchronize();
+                            C2EX
+
+                            const size_t print_count = std::min<size_t>(10, probe_size);
+                            const auto range_results =
+                                tmp_range_results_sorted.download(print_count);
+
+                            std::cerr << "Range query first " << print_count << " results:";
+                            for (size_t i = 0; i < print_count; ++i)
+                            {
+                                std::cerr << " " << range_results[i];
+                            }
+                            std::cerr << std::endl;
+
+                        }
+#else
+#pragma message "SKIP_RANGE_QUERIES=YES"
+                        range_query_time_ms = 0;
+#endif
 
                         // ----------------------------------------------------------------------
                         // ----------------------------------------------------------------------
@@ -2071,6 +2201,9 @@ void benchmark_updates(
                     }
                 }
                 // ----------------------------------------------------------------------
+
+
+                /////--------------- END
 
 #if !defined(UNSORTED_PROBES_CHECKS)
                 if (active_range_end < key_generation_size)
@@ -2344,6 +2477,7 @@ void benchmark_updates(
 
                 // PRINT PROBE TIME HERE
                 std::cerr << "    --Probe Time: -> " << probe_time_ms << " ms" << std::endl;
+                std::cerr << "    --Range Query Time: -> " << range_query_time_ms << " ms" << std::endl;
                 std::cerr << "    --Probe Miss Time: -> " << probe_miss_time_ms << " ms" << std::endl;
                 std::cerr << "    ---------------------- " << std::endl;
 
@@ -2386,6 +2520,7 @@ void benchmark_updates(
                         .add_parameter("after_update_size", after_update_size)
                         .add_measurement("insert_or_delete_time_ms", insert_or_delete_time_ms)
                         .add_measurement("probe_time_ms", probe_time_ms)
+                        .add_measurement("range_query_time_ms", range_query_time_ms)
                         .add_measurement("sort_time_ms", sort_time_ms)
                         .add_measurement("probe_miss_time_ms", probe_miss_time_ms)
                         .add_measurement("successor_hits_probe_time_ms", successor_hits_probe_time_ms)

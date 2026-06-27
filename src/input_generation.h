@@ -40,17 +40,17 @@ void generate_keys_hybrid_dense_file2(
     key_type min_usable_key,
     key_type max_usable_key,
     std::vector<key_type>& generated_keys,
-    size_t percentage_distribution_dense_keys = 25,
+    double percentage_distribution_dense_keys = 25,
     size_t percentage_new_keys_from_dense_region =75, // defaults to 75
     const std::string& filename = "keys_cache.txt"
    
 ) {
 
-    size_t x = percentage_distribution_dense_keys;
+    double x = percentage_distribution_dense_keys;
     size_t y = percentage_new_keys_from_dense_region;
 
      //printf("Calculated Range for x: %u Percent of distribution Length of Range per batch: %u, MINkey %u and MAXkey %u \n", x, range, min_usable_key, max_usable_key);
-    printf("Non Shifting Dense Range (Same Dense Range Always) X: %u Percent of distribution receives Y: %u of the insert keys per batch \n", x, y);
+    printf("Non Shifting Dense Range (Same Dense Range Always) X: %.3f Percent of distribution receives Y: %zu of the insert keys per batch \n", x, y);
    
 
     // ---------------------------CHECK FOR EXISTING CACHE---------------------------
@@ -96,13 +96,13 @@ void generate_keys_hybrid_dense_file2(
 
    // key_type range = static_cast<key_type>((max_usable_key - min_usable_key) * (x / 100.0));
 
-    key_type range = SDIV((max_usable_key - min_usable_key) * x, 100);
+    key_type range = static_cast<key_type>((max_usable_key - min_usable_key) * (x / 100.0));
    
     key_type lower_bound_dense_region = min_usable_key;
     key_type top_range_dense_region = min_usable_key + range;
 
-     printf("Calculated Range for x: %u Percent of distribution Length of Range per batch: %u, Minkey %u and Maxkey %u \n", x, range, min_usable_key, max_usable_key);
-    printf("x: %u Percent of distributio receives y: %u of the insert keys per batch \n", x, y);
+     printf("Calculated Range for x: %.3f Percent of distribution Length of Range per batch: %u, Minkey %u and Maxkey %u \n", x, range, min_usable_key, max_usable_key);
+    printf("x: %.3f Percent of distributio receives y: %zu of the insert keys per batch \n", x, y);
    
 
     std::uniform_int_distribution<key_type> dense_dist(lower_bound_dense_region, top_range_dense_region);
@@ -199,11 +199,11 @@ void generate_keys_hybrid_dense_file2_shifted(
     key_type max_usable_key,
     std::vector<key_type>& generated_keys,
     bool shift_dense_keys = false,
-    size_t percentage_distribution_dense_keys = 25,
+    double percentage_distribution_dense_keys = 25,
     size_t percentage_new_keys_from_dense_region = 75,
     const std::string& filename = "keys_cache_shifted.txt"
 ) {
-    size_t x = percentage_distribution_dense_keys;
+    double x = percentage_distribution_dense_keys;
     size_t y = percentage_new_keys_from_dense_region;
 
     if (!shift_dense_keys) {
@@ -254,10 +254,10 @@ void generate_keys_hybrid_dense_file2_shifted(
 std::vector<key_type> dense_pattern_vector;
 
     //key_type range = static_cast<key_type>((max_usable_key - min_usable_key) * (x / 100.0));
-    key_type range = SDIV((max_usable_key - min_usable_key) * x, 100) -1 ;
+    key_type range = static_cast<key_type>((max_usable_key - min_usable_key) * (x / 100.0)) - 1;
 
-    printf("Calculated Range for x: %u Percent of distribution Length of Range per batch: %u, MINkey %u and MAXkey %u \n", x, range, min_usable_key, max_usable_key);
-    printf("x: %u Percent of distributio receives y: %u of the insert keys per batch \n", x, y);
+    printf("Calculated Range for x: %.3f Percent of distribution Length of Range per batch: %u, MINkey %u and MAXkey %u \n", x, range, min_usable_key, max_usable_key);
+    printf("x: %.3f Percent of distributio receives y: %zu of the insert keys per batch \n", x, y);
    
    
     key_type lower_bound_dense_region = min_usable_key;
