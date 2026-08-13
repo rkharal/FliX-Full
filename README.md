@@ -1,60 +1,93 @@
-# Coarse-Granular RTIndeX
+# FliX: Flipped-Indexing for Scalable GPU Queries and Updates
 
-This repository contains the code for the paper _More Bang For Your Buck(et): Fast and Space-efficient Hardware-accelerated Coarse-granular Indexing on GPUs_, preprint at <https://arxiv.org/abs/2406.03965>.
+This repository contains the source code and experimental framework for the paper:  
+**_FliX: Flipped-Indexing for Scalable GPU Queries and Updates_**
 
-The code builds upon Ingo Wald's SIGGRAPH course, available at <https://github.com/ingowald/optix7course>.
+FliX is a high-performance GPU-resident indexing structure designed to support high-speed concurrent updates alongside fast point and range queries.
 
-The main CMake project file is located in the `src` directory.
+## Authors
 
-## Project Structure
+* **Rosina Kharal** — University of Waterloo, Canada
+* **Justus Henneberg** — Johannes Gutenberg University of Mainz, Germany
+* **Trevor Brown** — University of Waterloo, Canada
+* **Felix Schuhknecht** — Johannes Gutenberg University of  Mainz, Germany
 
-This project is organized into the following directories:
+## Previous Work
 
-- **btree/**: Source code for a GPU B-Tree implementation.
-- **ext/**: WarpCore dependencies and NVTX integration.
-- **src/**: Source code for both coarse-granular and fine-granular index structures.
-- **warpcore/**: Source code for WarpCore, a GPU Hash Table implementation.
+This code base builds on the original work of Justus Henneberg from the **Coarse-Granular RTIndeX** (_cgRX_) repository:
 
-## Directory Descriptions
+https://gitlab.rlp.net/juhenneb/coarse-granular-rtindex
 
-- **btree/**: Contains the source code for the GPU B-Tree implementation by Muhammad Awad et al., based on the paper [_Engineering a High-Performance GPU B-Tree_](https://dl.acm.org/doi/pdf/10.1145/3293883.3295706). This code is included as a performance benchmark for comparisons with the coarse-granular index.
+The current repository extends that earlier foundation of **cgRX** with the **FliX** implementation, additional benchmark support, new baselines, and updated experiments.
 
-- **ext/**: Includes various WarpCore dependencies and NVIDIA’s NVTX (NVIDIA Tools Extension) integration. NVTX is a cross-platform API for annotating source code to provide contextual information to developer tools like Nsight Systems and Nsight Compute, in order to help with performance analysis by marking code sections, events, and threads.
+## Project & Code Structure
 
-- **src/**: The primary codebase for the project’s coarse-granular index structure, designed to leverage hardware-accelerated ray tracing cores for efficient indexing.
+The codebase utilizes a benchmark-driven architecture where the specific index implementation is toggled at compile-time via macros.
 
-- **warpcore/**: Contains the source code for a GPU Hash Table implementation by Jünger et al., based on the paper [_WarpCore: Efficient Query Processing on Heterogeneous Hardware Accelerators_](https://arxiv.org/pdf/2009.07914). This is used to support hash-based indexing experiments and comparisons in the project.
+### Execution Flow:
+```text
+main.cu
+└── benchmark_updates (Kernel/Host Wrapper)
+    ├── Loads one benchmark configuration
+    ├── Selects data structure (Compile-time Macro)
+    │   ├── FliX        -> impl_cg_rtx_index_updates.cuh
+    │   ├── LSMu        -> impl_lsm_tree.cuh
+    │   ├── GPU-BTree   -> impl_tree_awad.cuh
+    │   ├── SlabHash    -> impl_hashtable_slab.cuh
+    │   └── WarpCore    -> impl_hashtable_warpcore.cuh
+    └── Executes benchmark operations
+        ├── index.insert
+        ├── index.remove
+        ├── index.lookup
+        ├── index.successor (FliX and LSMu only)
+        └── index.rebuild   (FliX only)
+```
 
-## Prerequisites
+The scripts in `runscripts_experiments/` automate the process of recompiling and running the benchmark for each structure sequentially to generate comparisons and output files for each.
 
-- Your **GPU must support NVIDIA RTX (hardware raytracing acceleration)**. For consumer GPUs, this applies to **NVIDIA RTX 2000, 3000, and 4000** series, but there are workstation and data-center GPUs that also support RTX.
-- Your GPU should have at least **24 GB of VRAM**. Smaller sizes will probably still be sufficient for most experiments, but are not guaranteed to.
-- Ensure your system runs **NVIDIA's 555.42 GPU driver** or newer.
-- Your system should have at least **32 GB of main memory**.
-- All experiments are designed to run on **64-bit Linux**. We successfully tested **ArchLinux and AlmaLinux 9.4**.
+## Benchmarked Data Structures
 
-## Installation
+If you use these baselines in your research, please cite the original publications:
 
-- Install the **CUDA 12.0 toolkit**:
-  - Option 1: Through your package manager (if available in the required version).
-  - Option 2: Manually by following the instructions on the NVIDIA website <https://developer.nvidia.com/cuda-downloads>. Depending on your current system setup, you might have to take additional steps, such as purging previous driver versions or disabling `nouveau`.
-  - After the installation, test whether the CUDA toolkit is part of the `PATH` by running `nvcc --version`. If `nvcc` is not found, add the `bin` subdirectory of the CUDA toolkit (typically `/opt/cuda/bin` or `/usr/local/cuda/bin`) to your `PATH`.
-- Parts of the code also depend on NVIDIA's **CUB and Thrust libraries**, which are included in the CUDA toolkit by default.
-- Install **OptiX 8.0**:
-  - Download OptiX from <https://developer.nvidia.com/designworks/optix/download> (requires an NVIDIA account).
-  - Run the installer script, preferably in your home directory.
-  - This will produce a directory called `NVIDIA-OptiX-SDK-8.0.0-linux64-x86_64` or similar.
-  - Set the environment variable `OptiX_INSTALL_DIR` to this directory, or add the directory to your `PATH`.
-- Install **CMake 3.20** or later.
-- Install **any version of `gcc`** that is compatible with your CUDA toolkit.
-- If your system contains multiple GPUs, set the `CUDA_VISIBLE_DEVICES` variable to force execution on a specific one.
+| Index Type | Reference | Link |
+| :--- | :--- | :--- |
+| **FliX** | *FliX: Flipped-Indexing for Scalable GPU Queries and Updates* | TBD |
+| **LSMu** | Ashkiani et al., *GPU LSM: A Dynamic Dictionary Data Structure for the GPU* | [DOI](https://ieeexplore.ieee.org/document/8425197) |
+| **GPU-BTree** | Awad et al., *Engineering a High-Performance GPU B-Tree* | [DOI](https://dl.acm.org/doi/10.1145/3293883.3295706) |
+| **Hash_Slab** | Ashkiani et al., *A Dynamic Hash Table for the GPU* | [DOI](https://doi.org/10.1109/IPDPS.2018.00052) |
+| **Hash_Warpcore** | Jünger et al., *WarpCore: A Library for Fast Hash Tables on GPUs* | [DOI](https://ieeexplore.ieee.org/document/9406635) |
 
-## Troubleshooting
+## Installation Requirements
 
-- If CMake is unable to find CUDA, try setting the following variables:
-  - `PATH=<CUDA toolkit root>/bin:$PATH`
-  - `CUDA_HOME=<CUDA toolkit root>`
-  - `CUDA_BIN_PATH=<CUDA toolkit root>/bin`
-  - `CUDACXX=<CUDA toolkit root>/bin/nvcc`
-- If you see something like `optix failed with code 7801`, update or re-install your driver.
-- If you receive an error about unsupported GPU architectures, update or re-install your CUDA toolkit.
+### Hardware
+* **NVIDIA GPU**: Support for concurrent kernels and sufficient VRAM (24GB+ recommended).
+* **Tested On**: NVIDIA RTX A6000 / RTX 6000 Ada.
+* **Memory**: 32 GB System RAM.
+* **OS**: 64-bit Linux 
+
+### Software
+* **CUDA Toolkit**: 12.8 or newer.
+* **Compiler**: `gcc` / `g++` version 12.1 or newer.
+* **Driver**: NVIDIA Driver version 555.42 or newer.
+
+
+## Usage and Experiments
+
+To reproduce the experimental results from the paper:
+
+1. Navigate to the `runscripts_experiments` directory.
+2. Run the desired benchmark scripts
+3. Results will be saved to the `results/` directory for visualization.
+
+> **Note:** Plotting scripts and additional run configurations are currently being integrated into the repository. Please check back for updates as we finalize the repo.
+
+## License and Attribution
+
+```cpp
+ =============================================================================
+ Authors:       Justus Henneberg, Rosina Kharal
+ Copyright (c) 2025-2026 Justus Henneberg, Rosina Kharal
+ SPDX-License-Identifier: GPL-3.0-or-later
+ =============================================================================
+```
+```
