@@ -102,12 +102,28 @@ inline constexpr smallsize lsm_tree = 1;
 inline constexpr smallsize lsm_tree = 0;
 #endif
 
+// -------------------- MANUAL BUILD-SIZE OVERRIDE --------------------
+inline constexpr size_t override_build_size = 100000005;
+
+#if defined(OVERRIDE_BUILD_TO_100M)
+inline constexpr bool override_build_to_100m = true;
+#else
+inline constexpr bool override_build_to_100m = false;
+#endif
+
 
 
 } // namespace compile_flags
 //////-------------------------
 
 
+
+#ifdef GROWTH_RATE
+constexpr smallsize growth_factor = GROWTH_RATE;    
+// constexpr smallsize RANGE_QUERY_SIZE = 1<<RQ_SIZE;
+#else
+constexpr smallsize growth_factor = 200;
+#endif
 
 #ifdef RQ_SIZE
 constexpr smallsize RANGE_QUERY_SIZE = 1<<RQ_SIZE;

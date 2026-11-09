@@ -135,7 +135,7 @@ DEVICEQUALIFIER int binarySearchIndex_leftmost_ge_strict(
     while (lo < hi)
     {
         const int mid = lo + (hi - lo) / 2;
-        if (array[mid] < key)
+        if (array[mid] < key) //% we want to find the first key LESS Than search key
         {
             lo = mid + 1;
         }

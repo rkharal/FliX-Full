@@ -154,6 +154,88 @@ void hashtable_slab_delete_kernel(
 }
 
 
+// Task codes for the fully concurrent (mixed batch) kernel, one per thread.
+// Same codes as awad_task in impl_tree_awad.cuh (range is unused here); separately named
+// so both headers can be included in one translation unit.
+enum slab_task : uint8_t {
+    slab_task_insert = 0,
+    slab_task_lookup = 1,
+    slab_task_delete = 2
+};
+
+
+// Fully concurrent mixed-batch kernel, following SlabHash's batched_operations: each thread
+// sets its own to_insert / to_delete / to_search flag, then the warp runs insertPair,
+// deleteKey and searchKey in that order. The operation comes from a per-thread task array
+// instead of the top bits of the key; keys are used as-is.
+//   keys    : key of each thread's operation
+//   values  : value to insert (only read for inserts)
+//   tasks   : operation of each thread (slab_task)
+//   results : per thread: insert/delete -> 1 on success, 0 on failure;
+//             lookup -> found value or not_found
+template <typename key_type, typename table_context_type, typename allocator_context_type>
+__global__
+void hashtable_slab_mixed_kernel(
+    const key_type* keys,
+    const smallsize* values,
+    const uint8_t* tasks,
+    smallsize* results,
+    smallsize num_ops,
+    table_context_type slab_hash
+) {
+    smallsize tid = threadIdx.x + blockIdx.x * blockDim.x;
+    smallsize lane_id = threadIdx.x & 0x1F;
+
+    if ((tid - lane_id) >= num_ops) {
+        return;
+    }
+
+    allocator_context_type local_allocator_ctx(slab_hash.getAllocatorContext());
+    local_allocator_ctx.initAllocator(tid, lane_id);
+
+    key_type key = 0;
+    smallsize value = 0;
+    smallsize bucket = 0;
+    uint32_t task = slab_task_lookup;
+    bool to_insert = false;
+    bool to_delete = false;
+    bool to_search = false;
+
+    if (tid < num_ops) {
+        key = keys[tid];
+        task = tasks[tid];
+        bucket = slab_hash.computeBucket(key);
+        to_insert = (task == slab_task_insert);
+        to_delete = (task == slab_task_delete);
+        to_search = (task == slab_task_lookup);
+        if (to_insert) {
+            value = values ? values[tid] : tid;
+        }
+    }
+
+    // first insertions:
+    slab_hash.insertPair(to_insert, lane_id, key, value, bucket, local_allocator_ctx);
+
+    // second deletions:
+    bool deleted = slab_hash.deleteKey(to_delete, lane_id, key, bucket);
+
+    // finally search queries:
+    smallsize result = not_found;
+    slab_hash.searchKey(to_search, lane_id, key, result, bucket);
+
+    if (tid < num_ops) {
+        if (task == slab_task_insert) {
+            // insertPair retries until the pair is placed and has no failure return
+            results[tid] = 1;
+        } else if (task == slab_task_delete) {
+            results[tid] = deleted ? 1 : 0;
+        } else if (task == slab_task_lookup) {
+            results[tid] = result;
+        }
+    }
+}
+
+
 template <typename table_context_type>
 __global__
 void hashtable_slab_count_kernel(
@@ -317,6 +399,19 @@ public:
     void remove(const key_type* update_list, size_t size, cudaStream_t stream) {
         hashtable_slab_delete_kernel<<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
             update_list,
+            size,
+            wrapped_table->gpu_context_);
+    }
+
+    // Fully concurrent mixed batch: one kernel, each thread performs the operation in tasks[]
+    // (see slab_task). values is read for inserts; result is written for every
+    // operation (insert/delete: 1 success, 0 failure; lookup: value or not_found).
+    void mixed_batch(const key_type* keys, const smallsize* values, const uint8_t* tasks, smallsize* result, size_t size, cudaStream_t stream) {
+        hashtable_slab_mixed_kernel<key_type, table_context_type, allocator_context_type><<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
+            keys,
+            values,
+            tasks,
+            result,
             size,
             wrapped_table->gpu_context_);
     }

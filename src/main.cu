@@ -7,7 +7,12 @@
 // =============================================================================
 
 #include "benchmarks.cuh"
+#ifdef UNSORTED_PROBE_BENCH
+#include "benchmarks_updates_unsorted.cuh"
+#else
 #include "benchmarks_updates.cuh"
+#endif
+#include "benchmark_updates_concurrent.cuh"
 #include "benchmarks_lookups.cuh"
 //#include "optix_wrapper.cuh"
 #include "result_collector.h"
@@ -153,7 +158,31 @@ int main(int argc, char* argv[]) {
 rc::result_collector rc;
 
 
-#ifdef BASELINES
+#ifdef UNSORTED_PROBE_BENCH
+// ICDE unsorted-probe experiment: EVERY index (FliX + all baselines) runs
+// benchmark_updates_unsorted (benchmarks_updates_unsorted.cuh). No mixed/concurrent batches.
+// Baselines get unsorted probes; FliX sorts probes before lookup and records the sort cost.
+    #ifdef BASELINES
+        #ifdef HASHTABLE_WARPCORE
+            #pragma message "UNSORTED_PROBE_BENCH: HASHTABLE_WARPCORE"
+            benchmark_updates_unsorted<hashtable_warpcore<key32, 80>>(rc, runs);
+        #elif defined(HASHTABLE_SLAB)
+            #pragma message "UNSORTED_PROBE_BENCH: HASHTABLE_SLAB"
+            benchmark_updates_unsorted<hashtable_slab<key32>>(rc, runs);
+        #elif defined(GPU_BTREE)
+            #pragma message "UNSORTED_PROBE_BENCH: GPU_BTREE"
+            benchmark_updates_unsorted<tree_awad<key32, true>>(rc, runs);
+        #elif defined(LSM_TREE)
+            #pragma message "UNSORTED_PROBE_BENCH: LSM_TREE"
+            benchmark_updates_unsorted<lsm_tree_ashkiani<key32, lsm_chunk_size_log>>(rc, runs);
+        #else
+            #error "UNSORTED_PROBE_BENCH with BASELINES needs a baseline selected"
+        #endif
+    #else
+        #pragma message "UNSORTED_PROBE_BENCH: FLIX"
+        benchmark_updates_unsorted<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
+    #endif
+#elif defined(BASELINES)
 #pragma message "BASELINES=YES"
 //  benchmark_updates<hashtable_warpcore<key32, 20>>(rc, runs);
 //  -------------benchmark_updates<cg_rtx_index<key32, 5>>(rc, runs);
@@ -162,11 +191,13 @@ rc::result_collector rc;
         benchmark_updates<hashtable_warpcore<key32, 80>>(rc, runs);
     #elif defined(HASHTABLE_SLAB)
         #pragma message "HASHTABLE_SLAB=YES"
-        benchmark_updates<hashtable_slab<key32>>(rc, runs);
+        // benchmark_updates<hashtable_slab<key32>>(rc, runs);
+        benchmark_updates_concurrent<hashtable_slab<key32>>(rc, runs);
         //benchmark_updates<hashtable_warpcore<key32, 80>>(rc, runs);
     #elif defined(GPU_BTREE)
         #pragma message "GPU_BTREE=YES"
-        benchmark_updates<tree_awad<key32, true>>(rc, runs);
+        // benchmark_updates<tree_awad<key32, true>>(rc, runs);
+        benchmark_updates_concurrent<tree_awad<key32, true>>(rc, runs);
     #elif defined(LSM_TREE)
     #pragma message "LSM_TREE=YES"
         benchmark_updates<lsm_tree_ashkiani<key32, lsm_chunk_size_log>>(rc, runs);
@@ -179,10 +210,12 @@ rc::result_collector rc;
     // --- benchmark_updates<cg_rtx_index_updates<key32, 0, 5, 50, 200>>(rc, runs);
     // benchmark_updates<cg_rtx_index_updates<key32, 10, 0, 50, 200>>(rc, runs);
 #else
-#pragma message "BASELINES=NO"
+#pragma message "BASELINES=NO, FLIX=YES"
+// FLIX
          //benchmark_updates<hashtable_warpcore<key32, 30>>(rc, runs);
         //printf("nodesize ,cachelinesize %d, %d\n", input_node_size, cache_line_size);
-        benchmark_updates<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
+        // benchmark_updates<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
+        benchmark_updates_concurrent<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
 #endif
        // benchmark_updates<cg_rtx_index_updates<key32, 0, 4, 50, 100>>(rc, runs);
        // benchmark_updates<cg_rtx_index_updates<key32, 10, 0, 40, 200>>(rc, runs);

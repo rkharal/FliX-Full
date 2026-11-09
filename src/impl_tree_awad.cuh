@@ -169,6 +169,88 @@ void modified_insert_kernel(
 }
 
 
+// Task codes for the fully concurrent (mixed batch) kernel, one per thread.
+enum awad_task : uint8_t {
+  awad_task_insert = 0,
+  awad_task_lookup = 1,
+  awad_task_delete = 2,
+  awad_task_range  = 3
+};
+
+
+// Fully concurrent mixed-batch kernel: Algorithm 1 (WCWS) of Awad et al., PPoPP 2019.
+// Each thread holds its own key and task; the tile serves one lane at a time in lane order,
+// and performTask is a switch over the broadcast task.
+//   keys         : key of each thread's operation
+//   values       : value to insert (only read for inserts)
+//   tasks        : operation of each thread (awad_task: insert, lookup or delete; range unused)
+//   results      : per thread: insert/delete -> 1 on success, 0 on failure;
+//                  lookup -> found value or not_found
+template <typename key_type, typename size_type, typename btree>
+GLOBALQUALIFIER
+void modified_mixed_kernel(
+    const key_type* keys,
+    const smallsize* values,
+    // const key_type* upper_bounds,   // removed: range queries are not run concurrently
+    const uint8_t* tasks,
+    smallsize* results,
+    const size_type keys_count,
+    btree tree
+) {
+  auto thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+  auto block     = cooperative_groups::this_thread_block();
+  auto tile      = cooperative_groups::tiled_partition<btree::branching_factor>(block);
+
+  if ((thread_id - tile.thread_rank()) >= keys_count) { return; }
+
+  auto key         = btree::invalid_key;
+  auto value       = btree::invalid_value;
+  uint32_t task    = awad_task_lookup;
+  bool is_active   = false;
+  if (thread_id < keys_count) {
+    key       = keys[thread_id];
+    task      = tasks[thread_id];
+    is_active = true;
+    if (task == awad_task_insert) { value = values[thread_id]; }
+  }
+
+  using allocator_type = typename btree::device_allocator_context_type;
+  allocator_type allocator{tree.allocator_, tile};
+
+  auto work_queue = tile.ballot(is_active);
+  while (work_queue) {
+    auto cur_rank = __ffs(work_queue) - 1;
+    auto cur_key  = tile.shfl(key, cur_rank);
+    auto cur_task = tile.shfl(task, cur_rank);
+
+    // performTask
+    smallsize cur_result = 0;
+    switch (cur_task) {
+      case awad_task_insert: {
+        auto cur_value = tile.shfl(value, cur_rank);
+        cur_result = tree.cooperative_insert(cur_key, cur_value, tile, allocator) ? 1 : 0;
+        break;
+      }
+      case awad_task_lookup: {
+        auto found = tree.cooperative_find(cur_key, tile, allocator, true);
+        cur_result = found != std::numeric_limits<uint32_t>::max() ? found : not_found;
+        break;
+      }
+      case awad_task_delete: {
+        cur_result = tree.cooperative_erase(cur_key, tile, allocator, true) ? 1 : 0;
+        break;
+      }
+    }
+
+    if (cur_rank == tile.thread_rank()) {
+      results[thread_id] = cur_result;
+      is_active = false;
+    }
+    work_queue = tile.ballot(is_active);
+  }
+}
+
+
 /*
 inline void test_modified_btree() {
     std::vector<uint32_t> keys {1, 2, 3, 4, 5, 6, 7, 8, 9};
@@ -295,6 +377,14 @@ public:
 
     void remove(const key_type* update_list, size_t size, cudaStream_t stream) {
         wrapped_tree.value().erase(update_list, size, stream);
+    }
+
+    // Fully concurrent mixed batch: one kernel, each thread performs the operation in tasks[]
+    // (see awad_task). values is read for inserts; result is written for every
+    // operation (insert/delete: 1 success, 0 failure; lookup: value or not_found).
+    // void mixed_batch(const key_type* keys, const smallsize* values, const key_type* upper_bounds, const uint8_t* tasks, smallsize* result, size_t size, cudaStream_t stream) {
+    void mixed_batch(const key_type* keys, const smallsize* values, const uint8_t* tasks, smallsize* result, size_t size, cudaStream_t stream) {
+        modified_mixed_kernel<<<SDIV(size, 512), 512, 0, stream>>>(keys, values, tasks, result, size, wrapped_tree.value());
     }
 
      void lookups_successor(const key_type* keys, key_type* result, size_t size, cudaStream_t stream) {

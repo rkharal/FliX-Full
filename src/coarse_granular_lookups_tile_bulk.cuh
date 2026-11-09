@@ -17,6 +17,12 @@
 #include "definitions_updates.cuh"
 #include "tile_utils.cuh"
 
+#ifdef PRINT_ORDERED_LOOKUP_TILE_COUNTER
+// Debug-only counter. It is reset immediately before each ordered lookup
+// launch and read by a one-thread kernel after that lookup completes.
+static __device__ unsigned long long ordered_lookup_tiles_entered = 0;
+#endif
+
 // file: src/process_lookup_tile_bulk_ordered.cuh
 
 #pragma once
@@ -334,6 +340,16 @@ DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup(
     smallsize i = minindex;
     key_type next_search_key = query_list[i];
 
+#ifdef PRINT_ORDERED_LOOKUP_TILE_COUNTER
+    if (lane == 0)
+    {
+        atomicAdd(&ordered_lookup_tiles_entered, 1ULL);
+        // Per-tile printing disabled; print only the final counter.
+        printf("LOOKUP TILE ENTER: tile_id=%d, minindex=%d\n",
+                static_cast<int>(tile_id), static_cast<int>(minindex));
+    }
+#endif
+
     /*
     if (lane ==0) {
             //printf(" PROCESS LOOKUP TILE BULK ORDERED: tile_id=%d, bucket_max=%llu, minindex=%d, maxindex=%d\n",
@@ -357,7 +373,10 @@ DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup(
 
         const key_type key = next_search_key;
 
-       
+         //printf("LOOKUP TILE ENTER LOOP:Valid key tile_id=%d, minindex=%d, next_search_key=%llu, bucket_max=%llu\n",
+          //      static_cast<int>(tile_id), static_cast<int>(minindex),
+           //     static_cast<unsigned long long>(next_search_key),
+           //     static_cast<unsigned long long>(bucket_max));
 
         // Leader walks chain until node's max >= key
         if (lane == 0)
@@ -471,13 +490,151 @@ DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup(
     }
 
 #ifdef PRINT_LOOKUPS_END
-    tile.sync(); // only valid if all threads in block reach here
+    tile.sync(); // only valid if all threads in the tile reach here
     if (tile_id == 0 && lane == 0)
     {
         printf("END TILE LOOKUPS: PRINT ALL NODES (debug)\n");
         print_set_nodes_and_links<key_type>(launch_params, tile_id);
     }
 #endif
+
+}
+
+#ifdef PRINT_ORDERED_LOOKUP_TILE_COUNTER
+template <typename key_type>
+GLOBALQUALIFIER void reset_ordered_lookup_tile_counter()
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        ordered_lookup_tiles_entered = 0;
+}
+
+template <typename key_type>
+GLOBALQUALIFIER void print_ordered_lookup_tile_counter(
+    updatable_cg_params *launch_params)
+{
+    (void)launch_params;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        printf("END TILE LOOKUPS: total tiles entered=%llu\n",
+               ordered_lookup_tiles_entered);
+    }
+}
+#endif
+
+// Single-threaded counterpart of process_lookup_tile_bulk_ordered_dup.
+// One CUDA thread owns one bucket and serially scans that bucket's node chain.
+template <typename key_type>
+DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup_single_threaded(
+    key_type bucket_max,
+    smallsize minindex,
+    smallsize maxindex,
+    updatable_cg_params *launch_params,
+    void *starting_node,
+    const key_type *__restrict__ query_list,
+    smallsize query_size,
+    smallsize *__restrict__ results)
+{
+    (void)maxindex;
+
+    void *allocation_buffer = launch_params->allocation_buffer;
+    const smallsize allocation_count = launch_params->allocation_buffer_count;
+    const smallsize node_stride = launch_params->node_stride;
+    const smallsize node_size = launch_params->node_size;
+    const smallsize lastpos_off = get_lastposition_bytes<key_type>(node_size);
+
+    void *curr_node = starting_node;
+    smallsize query_index = minindex;
+
+    while (query_index < query_size && query_list[query_index] <= bucket_max)
+    {
+        const key_type search_key = query_list[query_index];
+        key_type curr_max = cg::extract<key_type>(curr_node, 0);
+
+        // Move forward through this bucket's overflow chain until the current
+        // node can contain search_key.
+        while (curr_max < search_key)
+        {
+            const smallsize next_ptr =
+                cg::extract<smallsize>(curr_node, lastpos_off);
+
+            if (next_ptr == 0 || (next_ptr - 1) >= allocation_count)
+            {
+                ERROR_INSERTS(
+                    "ERROR: invalid link in node chain during single-threaded ordered lookup",
+                    search_key,
+                    query_index);
+
+                // The current node cannot cover this key and no valid later
+                // node is available. Sorted later queries in this bucket are
+                // misses as well.
+                while (query_index < query_size &&
+                       query_list[query_index] <= bucket_max)
+                {
+                    results[query_index] = not_found;
+                    ++query_index;
+                }
+                return;
+            }
+
+            void *next_node =
+                static_cast<uint8_t *>(allocation_buffer) +
+                (static_cast<size_t>(next_ptr) - 1) * node_stride;
+            const key_type next_max = cg::extract<key_type>(next_node, 0);
+
+            if (next_max <= curr_max)
+            {
+                ERROR_INSERTS(
+                    "ERROR: non-increasing node chain during single-threaded ordered lookup",
+                    search_key,
+                    query_index);
+                while (query_index < query_size &&
+                       query_list[query_index] <= bucket_max)
+                {
+                    results[query_index] = not_found;
+                    ++query_index;
+                }
+                return;
+            }
+
+            curr_node = next_node;
+            curr_max = next_max;
+        }
+
+        const smallsize curr_size =
+            cg::extract<smallsize>(curr_node, sizeof(key_type));
+
+        // All sorted queries up to curr_max belong to this node. Search each
+        // distinct key once and reuse its result for adjacent duplicates.
+        bool have_cached_result = false;
+        key_type cached_key = key_type(0);
+        smallsize cached_result = not_found;
+
+        while (query_index < query_size &&
+               query_list[query_index] <= curr_max)
+        {
+            const key_type query_key = query_list[query_index];
+
+            if (!have_cached_result || cached_key != query_key)
+            {
+                cached_key = query_key;
+                cached_result = not_found;
+                have_cached_result = true;
+
+                for (smallsize slot = 1; slot <= curr_size; ++slot)
+                {
+                    if (extract_key_node<key_type>(curr_node, slot) == query_key)
+                    {
+                        cached_result =
+                            extract_offset_node<key_type>(curr_node, slot);
+                        break;
+                    }
+                }
+            }
+
+            results[query_index] = cached_result;
+            ++query_index;
+        }
+    }
 }
 
 // template <typename key_type, bool process_single_thread_per_bucket>
@@ -578,6 +735,7 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered(
     // Find query subrange for this bucket
     int minindex = -1;
     int maxindex = -1;
+    int should_process = 0;
 
     if (lane == 0)
     {
@@ -590,26 +748,30 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered(
         than every query key. That lets the empty overflow bucket process and
         overwrite the final query result with not_found.
         */
+       // printf("Going to Do Binary Search %d\n", tile_id);
         minindex = binarySearchIndex_leftmost_ge_strict<key_type>(query_list, minkey, 0, query_size);
+        should_process =
+            (minindex >= 0 && query_list[minindex] <= maxkey) ? 1 : 0;
         // maxindex: last position <= maxkey
         // maxindex = binarySearchIndex_first_gt_leftmost_dup<key_type>(query_list, maxkey, 0, query_size);
     }
     minindex = tile.shfl(minindex, 0);
+    should_process = tile.shfl(should_process, 0);
     // maxindex = tile.shfl(maxindex, 0);
     // if (lane ==0) printf("After Searches LOOKUP TILE BULK ORDERED: tile_id=%d, bucket=[%llu..%llu], query_range=[%d..%d]\n",
     // minindex, maxindex);
-    // const bool empty = (minindex > maxindex) | (minindex < 0) | (maxindex < 0);
-    const bool empty = (minindex < 0);
-    if (tile.any(empty))
+    // A lower bound can point to the first query in a later bucket. Exit unless
+    // this bucket's maximum includes that query.
+    if (!should_process)
         // if (lane ==0) printf("EXITING LOOKUP TILE BULK ORDERED: tile_id=%d, empty=%d minkey=%llu maxkey=%llu , minindex=%d \n", tile_id, empty, static_cast<unsigned long long>(minkey), static_cast<unsigned long long>(maxkey), minindex);
         return;
-
-    // if (empty) return;
 
     // Node for this bucket
     uint8_t *__restrict__ curr_node =
         static_cast<uint8_t *>(launch_params->ordered_node_pairs) +
         static_cast<size_t>(launch_params->node_stride) * static_cast<size_t>(tile_id);
+
+  // if (lane == 0) printf("Going to Do BULK Search tile id %d Minindex %d \n", tile_id, minindex);
 
     process_lookup_tile_bulk_ordered_dup<key_type>(
         // process_lookup_tile_bulk_ordered<key_type>(
@@ -625,6 +787,56 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered(
         /*writeback*/ results);
 
     // if (lane ==0) printf("END LOOKUP TILE BULK ORDERED: tile_id=%d DONE\n", tile_id);
+}
+
+// Single-threaded counterpart of lookup_kernel_tile_ordered.
+// The host launch supplies one logical CUDA thread per bucket.
+template <typename key_type>
+GLOBALQUALIFIER void lookup_kernel_tile_ordered_single_threaded(
+    updatable_cg_params *__restrict__ launch_params,
+    const key_type *__restrict__ query_list,
+    smallsize *__restrict__ results,
+    smallsize query_size)
+{
+    const smallsize bucket_id =
+        static_cast<smallsize>(blockIdx.x * blockDim.x + threadIdx.x);
+    const smallsize partition_count_with_overflow =
+        launch_params->partition_count_with_overflow;
+
+    if (bucket_id >= partition_count_with_overflow)
+        return;
+
+    const key_type *__restrict__ maxbuf =
+        static_cast<const key_type *>(launch_params->maxvalues);
+    const key_type maxkey = maxbuf[bucket_id];
+    const key_type minkey =
+        (bucket_id > 0)
+            ? (maxbuf[bucket_id - 1] + static_cast<key_type>(1))
+            : static_cast<key_type>(1);
+
+    // query_list is sorted. Find the first query owned by this bucket.
+    const int minindex = binarySearchIndex_leftmost_ge_strict<key_type>(
+        query_list, minkey, 0, static_cast<int>(query_size));
+
+    // A lower bound can point to the first query in a later bucket. Skip this
+    // bucket unless its maximum includes that query.
+    if (minindex < 0 || query_list[minindex] > maxkey)
+        return;
+
+    uint8_t *__restrict__ curr_node =
+        static_cast<uint8_t *>(launch_params->ordered_node_pairs) +
+        static_cast<size_t>(launch_params->node_stride) *
+            static_cast<size_t>(bucket_id);
+
+    process_lookup_tile_bulk_ordered_dup_single_threaded<key_type>(
+        /*bucket_max*/ maxkey,
+        /*minindex*/ static_cast<smallsize>(minindex),
+        /*maxindex*/ query_size - 1,
+        launch_params,
+        /*curr_node*/ curr_node,
+        /*sorted queries*/ query_list,
+        /*query_size*/ query_size,
+        /*writeback*/ results);
 }
 
 // Assumes: not_found, TILE_SIZE, cg::extract/set, extract_key_node, extract_offset_node, get_lastposition_bytes

@@ -5,6 +5,21 @@
 #include "coarse_granular_lookups_tile_bulk.cuh"
 
 
+// Parallel per-bucket counterpart of the single-owner naive range-sum walk
+// (process_lookup_tile_bulk_ordered_rq_sums_naive): instead of one tile
+// owning a query end-to-end and hopping bucket to bucket, every tile here
+// independently scans for queries that overlap its own bucket and
+// atomically contributes only its own bucket-local partial sum. A query
+// spanning many buckets is therefore covered by many tiles running
+// concurrently instead of one tile visiting those buckets serially.
+//
+// For a query that fully spans this bucket (qlow <= bucket_min and
+// qhigh >= bucket_max), the bucket's entire contribution is already known --
+// it's `bucket_full_sum`, computed once up front by
+// precompute_bucket_offset_sums_kernel -- so no node-chain walk is needed at
+// all. The node-by-node scan below only ever runs for a bucket that a query's
+// lo or hi boundary actually lands inside (at most two buckets per query).
+// `results` must be zero-initialized by the caller before this kernel runs.
 template <typename key_type>
 DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup_rq(
     key_type bucket_min,
@@ -17,7 +32,8 @@ DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup_rq(
     const key_type *__restrict__ lowest_list,
     const key_type *__restrict__ highest_list,
     smallsize query_size,
-    smallsize *__restrict__ results)
+    smallsize *__restrict__ results,
+    smallsize bucket_full_sum)
 {
     void *allocation_buffer = launch_params->allocation_buffer;
     const smallsize allocation_count = launch_params->allocation_buffer_count;
@@ -41,6 +57,17 @@ DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup_rq(
 
         if (qhigh < bucket_min)
             continue;
+
+        // Whole bucket lies inside [qlow, qhigh]: reuse the precomputed
+        // full-bucket sum instead of re-walking the node chain.
+        if (qlow <= bucket_min && qhigh >= bucket_max)
+        {
+            if (lane == 0 && bucket_full_sum != 0)
+                atomicAdd(results + qi, bucket_full_sum);
+
+            tile.sync();
+            continue;
+        }
 
         const key_type search_key = (qlow > bucket_min) ? qlow : bucket_min;
         if (lane == 0)
@@ -66,7 +93,7 @@ DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup_rq(
         p = tile.shfl(p, 0);
         void *scan_node = reinterpret_cast<void *>(p);
 
-        smallsize query_sum = 0;
+        unsigned long long query_sum = 0;
         while (true)
         {
             key_type curr_max = key_type(0);
@@ -111,7 +138,7 @@ DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup_rq(
                 partial_sum += tile.shfl_down(partial_sum, delta);
 
             if (lane == 0)
-                query_sum += partial_sum;
+                query_sum += static_cast<unsigned long long>(partial_sum);
 
             if (curr_max >= bucket_max || curr_max >= qhigh)
                 break;
@@ -136,7 +163,7 @@ DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_dup_rq(
         }
 
         if (lane == 0 && query_sum != 0)
-            atomicAdd(results + qi, query_sum);
+            atomicAdd(results + qi, static_cast<smallsize>(query_sum));
 
         tile.sync();
     }
@@ -146,13 +173,11 @@ template <typename key_type>
 GLOBALQUALIFIER void lookup_kernel_tile_ordered_rq(
     updatable_cg_params *__restrict__ launch_params,
     const key_type *__restrict__ lowest_list,   // sorted by lower bound
-    const key_type *__restrict__ highest_list,  // paired with lowest_list
-    const smallsize *__restrict__ bucket_offset_sums,
-    smallsize *__restrict__ results,            // must be zero-initialized
+    const key_type *__restrict__ highest_list,  // paired with lowest_list, non-decreasing
+    const smallsize *__restrict__ bucket_offset_sums,  // per-bucket full sum, from precompute_bucket_offset_sums_kernel
+    smallsize *__restrict__ results,            // must be zero-initialized; tiles atomicAdd into it
     smallsize query_size)
 {
-    (void)bucket_offset_sums;
-
     const key_type *__restrict__ maxbuf =
         static_cast<const key_type *>(launch_params->maxvalues);
     const smallsize partition_count_with_overflow =
@@ -164,6 +189,7 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered_rq(
 
     const int tiles_per_block = blockDim.x / tile.size();
     const int tile_id = blockIdx.x * tiles_per_block + tile.meta_group_rank();
+    const smallsize lane = tile.thread_rank();
 
     if (tile_id >= partition_count_with_overflow || query_size == 0)
         return;
@@ -174,25 +200,270 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered_rq(
             ? (maxbuf[tile_id - 1] + static_cast<key_type>(1))
             : static_cast<key_type>(1);
 
-    const int minindex = 0;
+    // Only queries whose upper bound reaches into this bucket can possibly
+    // overlap it. highest_list is non-decreasing (paired with sorted
+    // lowest_list via a monotonic per-key transform), so binary search finds
+    // the first such query instead of every tile scanning from index 0.
+    int minindex = 0;
+    if (lane == 0)
+    {
+        minindex = binarySearchIndex_leftmost_ge_strict<key_type>(
+            highest_list, minkey, 0, static_cast<int>(query_size));
+    }
+    minindex = tile.shfl(minindex, 0);
+
+    if (minindex < 0)
+        return; // no query reaches into this bucket
 
     uint8_t *__restrict__ curr_node =
         static_cast<uint8_t *>(launch_params->ordered_node_pairs) +
         static_cast<size_t>(launch_params->node_stride) *
             static_cast<size_t>(tile_id);
 
+    const smallsize bucket_full_sum =
+        (bucket_offset_sums != nullptr) ? bucket_offset_sums[tile_id] : smallsize(0);
+
     process_lookup_tile_bulk_ordered_dup_rq<key_type>(
-        /*bucket_min*/   minkey,
-        /*bucket_max*/   maxkey,
-        /*minindex*/     minindex,
-        // /-*maxindex*-/ maxindex,
-                         launch_params,
-        /*curr_node*/    curr_node,
-        /*tile*/         tile,
-        /*lowest_list*/  lowest_list,
-        /*highest_list*/ highest_list,
-        /*query_size*/   query_size,
-        /*writeback*/    results);
+        /*bucket_min*/      minkey,
+        /*bucket_max*/      maxkey,
+        /*minindex*/        minindex,
+        // /-*maxindex*-/   maxindex,
+                            launch_params,
+        /*curr_node*/       curr_node,
+        /*tile*/            tile,
+        /*lowest_list*/     lowest_list,
+        /*highest_list*/    highest_list,
+        /*query_size*/      query_size,
+        /*writeback*/       results,
+        /*bucket_full_sum*/ bucket_full_sum);
+}
+
+// Naive range-sum counterpart of process_lookup_tile_bulk_ordered_dup: exactly
+// one tile -- the owner of the bucket containing a query's lower bound, found
+// the same way lookup_kernel_tile_ordered finds exact-match owners -- computes
+// and writes that query's full sum. No other tile may contribute to the same
+// query, so no atomics are needed.
+//
+// For each owned query (processed one at a time), the tile starts at the
+// owner bucket's node containing lo and sums node by node via a tile-wide
+// shuffle reduction (same reduction shape as precompute_bucket_offset_sums_kernel /
+// lookup_kernel_tile_ordered_rq_sums), stopping as soon as a node's own max
+// key reaches/exceeds hi. If a bucket's chain is exhausted before hi is
+// reached, the tile moves to the next bucket's first node (no skip-search
+// needed there -- every key in a later bucket is already >= lo) and repeats.
+// The tile then returns to its own bucket for the next owned query.
+template <typename key_type>
+DEVICEQUALIFIER void *get_bucket_head_node(
+    updatable_cg_params *__restrict__ launch_params,
+    smallsize bucket_index);
+
+template <typename key_type>
+DEVICEQUALIFIER void process_lookup_tile_bulk_ordered_rq_sums_naive(
+    key_type bucket_min,
+    key_type bucket_max,
+    smallsize minindex,
+    updatable_cg_params *launch_params,
+    void *starting_node,
+    coop_g::thread_block_tile<TILE_SIZE> tile,
+    const key_type *__restrict__ lower_list,
+    const key_type *__restrict__ upper_list,
+    smallsize query_size,
+    smallsize *__restrict__ results)
+{
+    (void)bucket_min; // per-key filtering uses lower_list[qi] directly
+
+    void *allocation_buffer = launch_params->allocation_buffer;
+    const smallsize allocation_count = launch_params->allocation_buffer_count;
+    const smallsize node_stride = launch_params->node_stride;
+    const smallsize node_size = launch_params->node_size;
+    const smallsize partition_count_with_overflow =
+        launch_params->partition_count_with_overflow;
+
+    const smallsize lastpos_off = get_lastposition_bytes<key_type>(node_size);
+    const smallsize lane = tile.thread_rank();
+    const smallsize owner_bucket_id =
+        blockIdx.x * (blockDim.x / tile.size()) + tile.meta_group_rank();
+
+    // Walk every range query owned by this bucket, one at a time.
+    for (smallsize qi = minindex; qi < query_size && lower_list[qi] <= bucket_max; ++qi)
+    {
+        const key_type lo = lower_list[qi];
+        const key_type hi = upper_list[qi];
+
+        smallsize current_bucket_id = owner_bucket_id;
+        void *curr_node = starting_node;
+        unsigned long long query_sum = 0;
+
+        // Skip any leading nodes in the owner bucket that are entirely below lo.
+        if (lane == 0)
+        {
+            key_type node_max = cg::extract<key_type>(curr_node, 0);
+            while (node_max < lo)
+            {
+                const smallsize next_ptr = cg::extract<smallsize>(curr_node, lastpos_off);
+                if (next_ptr == 0 || (next_ptr - 1) >= allocation_count)
+                {
+                    ERROR_INSERTS(
+                        "ERROR: invalid link in node chain during naive tile range sum start search",
+                        lo, lane, owner_bucket_id);
+                }
+                curr_node = static_cast<uint8_t *>(allocation_buffer) +
+                            static_cast<size_t>(next_ptr - 1) * node_stride;
+                node_max = cg::extract<key_type>(curr_node, 0);
+            }
+        }
+        {
+            uintptr_t p0 = reinterpret_cast<uintptr_t>(curr_node);
+            p0 = tile.shfl(p0, 0);
+            curr_node = reinterpret_cast<void *>(p0);
+        }
+
+        bool range_fully_covered = false;
+
+        while (true)
+        {
+            // Sum every node in current_bucket_id's chain, node by node,
+            // stopping as soon as a node's own max key reaches/exceeds hi --
+            // no later node, in this bucket or any later bucket, can still
+            // hold a key <= hi.
+            while (true)
+            {
+                key_type curr_max = key_type(0);
+                smallsize curr_size = 0;
+                smallsize next_ptr = 0;
+
+                if (lane == 0)
+                {
+                    curr_max = cg::extract<key_type>(curr_node, 0);
+                    curr_size = cg::extract<smallsize>(curr_node, sizeof(key_type));
+                    next_ptr = cg::extract<smallsize>(curr_node, lastpos_off);
+                }
+                curr_max = tile.shfl(curr_max, 0);
+                curr_size = tile.shfl(curr_size, 0);
+                next_ptr = tile.shfl(next_ptr, 0);
+
+                key_type my_key = key_type(0);
+                smallsize my_offset = 0;
+                const bool lane_live = (lane < curr_size);
+                if (lane_live)
+                {
+                    my_key = extract_key_node<key_type>(curr_node, lane + 1);
+                    my_offset = extract_offset_node<key_type>(curr_node, lane + 1);
+                }
+
+                smallsize partial =
+                    (lane_live && my_key >= lo && my_key <= hi) ? my_offset : 0;
+
+#pragma unroll
+                for (int delta = tile.size() / 2; delta > 0; delta >>= 1)
+                    partial += tile.shfl_down(partial, delta);
+
+                if (lane == 0)
+                    query_sum += static_cast<unsigned long long>(partial);
+
+                if (curr_max >= hi)
+                {
+                    range_fully_covered = true;
+                    break; // this node already reaches hi -- nothing further needed
+                }
+
+                if (next_ptr == 0)
+                    break; // this bucket's chain is exhausted, hi not yet reached
+
+                if (lane == 0)
+                {
+                    if ((next_ptr - 1) >= allocation_count)
+                    {
+                        ERROR_INSERTS(
+                            "ERROR: invalid link in node chain during naive tile range sum",
+                            hi, lane, current_bucket_id);
+                    }
+                    curr_node = static_cast<uint8_t *>(allocation_buffer) +
+                                static_cast<size_t>(next_ptr - 1) * node_stride;
+                }
+                uintptr_t p = reinterpret_cast<uintptr_t>(curr_node);
+                p = tile.shfl(p, 0);
+                curr_node = reinterpret_cast<void *>(p);
+                tile.sync();
+            }
+
+            if (range_fully_covered)
+                break; // done -- the range is fully covered
+
+            // Otherwise this bucket is exhausted but hi isn't reached yet --
+            // move to the next bucket and keep summing from its first node.
+            ++current_bucket_id;
+            if (current_bucket_id >= partition_count_with_overflow)
+                break; // ran out of buckets; nothing further to sum
+
+            curr_node = get_bucket_head_node<key_type>(launch_params, current_bucket_id);
+            tile.sync();
+        }
+
+        if (lane == 0)
+            results[qi] = static_cast<smallsize>(query_sum);
+
+        tile.sync();
+    }
+}
+
+template <typename key_type>
+GLOBALQUALIFIER void lookup_kernel_tile_ordered_rq_sums_naive(
+    updatable_cg_params *__restrict__ launch_params,
+    const key_type *__restrict__ lower_list,  // sorted by lower bound
+    const key_type *__restrict__ upper_list,  // paired with lower_list
+    smallsize *__restrict__ results,          // output
+    smallsize query_size)
+{
+    const key_type *__restrict__ maxbuf = static_cast<const key_type *>(launch_params->maxvalues);
+    const smallsize partition_count_with_overflow = launch_params->partition_count_with_overflow;
+
+    coop_g::thread_block block = coop_g::this_thread_block();
+    coop_g::thread_block_tile<TILE_SIZE> tile = coop_g::tiled_partition<TILE_SIZE>(block);
+
+    const int tiles_per_block = blockDim.x / tile.size();
+    const int tile_id = blockIdx.x * tiles_per_block + tile.meta_group_rank();
+    const smallsize lane = tile.thread_rank();
+
+    if (tile_id >= partition_count_with_overflow)
+        return;
+
+    const key_type maxkey = maxbuf[tile_id];
+    const key_type minkey = (tile_id > 0) ? (maxbuf[tile_id - 1] + static_cast<key_type>(1)) : static_cast<key_type>(1);
+
+    // Find the range-query subrange owned by this bucket using the lower
+    // bound, exactly the way lookup_kernel_tile_ordered finds the exact-match
+    // subrange owned by each bucket.
+    int minindex = -1;
+    int should_process = 0;
+
+    if (lane == 0)
+    {
+        minindex = binarySearchIndex_leftmost_ge_strict<key_type>(lower_list, minkey, 0, query_size);
+        should_process =
+            (minindex >= 0 && lower_list[minindex] <= maxkey) ? 1 : 0;
+    }
+    minindex = tile.shfl(minindex, 0);
+    should_process = tile.shfl(should_process, 0);
+
+    if (!should_process)
+        return;
+
+    uint8_t *__restrict__ curr_node =
+        static_cast<uint8_t *>(launch_params->ordered_node_pairs) +
+        static_cast<size_t>(launch_params->node_stride) * static_cast<size_t>(tile_id);
+
+    process_lookup_tile_bulk_ordered_rq_sums_naive<key_type>(
+        /*bucket_min*/ minkey,
+        /*bucket_max*/ maxkey,
+        /*minindex*/   static_cast<smallsize>(minindex),
+        launch_params,
+        /*curr_node*/  curr_node,
+        /*tile*/       tile,
+        /*lower_list*/ lower_list,
+        /*upper_list*/ upper_list,
+        /*query_size*/ query_size,
+        /*writeback*/  results);
 }
 
 template <typename key_type>

@@ -703,7 +703,7 @@ public:
 
 private:
     // taken from original code
-    static constexpr size_t threads_per_block = 512; // MAXBLOCKSIZE;  // 256;
+    static constexpr size_t threads_per_block = 1024; // MAXBLOCKSIZE;  // 256;
     static constexpr size_t max_cached_levels = 8;
     static constexpr size_t chunk_size = size_t(1) << chunk_size_log;
     static constexpr size_t cg_size = size_t(1) << cg_size_log;

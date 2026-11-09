@@ -7,6 +7,26 @@ comment_directory/
 Original_*/
 
 build/*
+build_unsorted*/
+Codex_Backups/
+.claude/
+KEEP_benchmarks_updates/
+Original_Benchmarks_Updates_July2026/
+Original_Benchmarks_Updates_June2026/
+ResearchDocuments/
+app/
+backup/
+backup_before_mixed_batches/
+backup_benchmarks/
+backup_benchmarks_Sept16/
+backup_jan13_2025/
+cmake/
+mixed_batches/
+mixed*/
+KEEP*/
+KeepOld*/
+Original*/
+Research*/
 
 # Keep this directory in the repo
 !build/runscripts_experiments/

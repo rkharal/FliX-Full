@@ -37,7 +37,66 @@
 // #define COMBINE_INSERT_DELETE
 // #define COMPUTE_TOTALKEYS
 #define SKIP_RANGE_QUERIES 1
+//#define VERIFY_RANGE_QUERIES 1
+// Original default:
+// constexpr bool ENABLE_DUMMY_INSERTS = false;
+// The warm-up experiment can enable the existing dummy-insert path per build.
+#ifdef ENABLE_INSERT_WARMUP
+constexpr bool ENABLE_DUMMY_INSERTS = true;
+#else
 constexpr bool ENABLE_DUMMY_INSERTS = false;
+#endif
+
+// Original point-query warm-up condition was simply: if (step == 0).
+// Preserve that default for existing experiments, while allowing the
+// no-warm-up build to disable it explicitly.
+#ifdef DISABLE_QUERY_HIT_WARMUP
+constexpr bool ENABLE_QUERY_HIT_WARMUP = false;
+#else
+constexpr bool ENABLE_QUERY_HIT_WARMUP = true;
+#endif
+
+/*
+ * Previous query-warm-up size selection.  Retained for provenance, but the
+ * 20-query path is intentionally disabled: an enabled query warm-up must run
+ * the same complete probe batch as the measured query.
+ *
+ * #ifdef FULL_QUERY_HIT_WARMUP
+ * constexpr bool USE_FULL_QUERY_HIT_WARMUP = true;
+ * #else
+ * constexpr bool USE_FULL_QUERY_HIT_WARMUP = false;
+ * #endif
+ */
+
+#ifdef INSERT_WARMUP_KEY_COUNT
+constexpr size_t insert_warmup_key_count = INSERT_WARMUP_KEY_COUNT;
+#else
+constexpr size_t insert_warmup_key_count = 10;
+#endif
+
+// Optional first-deletion warm-up. When enabled, the first deletion round
+// performs one untimed remove using a prefix of that round's real delete list.
+#ifdef ENABLE_DELETE_WARMUP
+constexpr bool ENABLE_DUMMY_DELETES = true;
+#else
+constexpr bool ENABLE_DUMMY_DELETES = false;
+#endif
+
+#ifdef DELETE_WARMUP_KEY_COUNT
+constexpr size_t delete_warmup_key_count = DELETE_WARMUP_KEY_COUNT;
+#else
+constexpr size_t delete_warmup_key_count = 1000;
+#endif
+
+// Original default: alternating_insert_delete = false (phased schedule: all
+// insertion rounds, then all deletion rounds). A schedule-comparison
+// experiment can request the alternating insert/delete/insert/delete...
+// schedule instead, with the same total round count.
+#ifdef ALTERNATING_INSERT_DELETE
+constexpr bool ALTERNATE_INSERT_DELETE_ROUNDS = true;
+#else
+constexpr bool ALTERNATE_INSERT_DELETE_ROUNDS = false;
+#endif
 #ifdef REBUILD_INTERVAL
 constexpr smallsize rebuild_frequency = REBUILD_INTERVAL; // every round;
 #else
@@ -101,6 +160,100 @@ std::vector<key_type> make_range_upper_keys(const std::vector<key_type> &lower_k
     }
 
     return upper_keys;
+}
+
+template <typename key_type>
+std::vector<unsigned long long> compute_expected_range_sums(
+    const std::vector<key_type> &generated_keys,
+    size_t active_range_start,
+    size_t active_range_end,
+    bool start_expected_offset_at_zero,
+    const std::vector<key_type> &lower_keys,
+    const std::vector<key_type> &upper_keys)
+{
+    std::vector<std::pair<key_type, smallsize>> active_pairs;
+    active_pairs.reserve(active_range_end - active_range_start);
+
+    for (size_t index = active_range_start; index < active_range_end; ++index)
+    {
+        const smallsize offset =
+            start_expected_offset_at_zero
+                ? static_cast<smallsize>(index - active_range_start)
+                : static_cast<smallsize>(index);
+        active_pairs.emplace_back(generated_keys[index], offset);
+    }
+
+    std::sort(
+        active_pairs.begin(),
+        active_pairs.end(),
+        [](const auto &lhs, const auto &rhs) {
+            return lhs.first < rhs.first;
+        });
+
+    std::vector<key_type> sorted_keys;
+    std::vector<unsigned long long> prefix_sums(active_pairs.size() + 1, 0);
+    sorted_keys.reserve(active_pairs.size());
+
+    for (size_t i = 0; i < active_pairs.size(); ++i)
+    {
+        sorted_keys.push_back(active_pairs[i].first);
+        prefix_sums[i + 1] =
+            prefix_sums[i] + static_cast<unsigned long long>(active_pairs[i].second);
+    }
+
+    std::vector<unsigned long long> expected(lower_keys.size(), 0);
+    for (size_t i = 0; i < lower_keys.size(); ++i)
+    {
+        if (lower_keys[i] > upper_keys[i])
+            continue;
+
+        const auto lower_it =
+            std::lower_bound(sorted_keys.begin(), sorted_keys.end(), lower_keys[i]);
+        const auto upper_it =
+            std::upper_bound(sorted_keys.begin(), sorted_keys.end(), upper_keys[i]);
+
+        const size_t lower_pos =
+            static_cast<size_t>(std::distance(sorted_keys.begin(), lower_it));
+        const size_t upper_pos =
+            static_cast<size_t>(std::distance(sorted_keys.begin(), upper_it));
+
+        expected[i] = prefix_sums[upper_pos] - prefix_sums[lower_pos];
+    }
+
+    return expected;
+}
+
+// range_lookup_sum's result buffer is `smallsize` (uint32_t): the device kernel
+// accumulates in 64-bit but truncates to 32-bit on the final store (see
+// coarse_granular_range_queries.cuh). Compare in that same truncated domain so a
+// legitimately large (but correctly computed) sum isn't reported as a mismatch.
+bool is_matching_range_result(
+    const std::vector<unsigned long long> &expected_result,
+    const std::vector<smallsize> &actual_result,
+    std::string &error_message)
+{
+    if (expected_result.size() != actual_result.size())
+    {
+        error_message = "range result size mismatch: expected " +
+                        std::to_string(expected_result.size()) +
+                        ", received " + std::to_string(actual_result.size());
+        return false;
+    }
+
+    for (size_t i = 0; i < expected_result.size(); ++i)
+    {
+        const smallsize expected_truncated = static_cast<smallsize>(expected_result[i]);
+        if (expected_truncated != actual_result[i])
+        {
+            error_message = "range data mismatch at index " + std::to_string(i) +
+                            ": expected " + std::to_string(expected_result[i]) +
+                            " (truncated to " + std::to_string(expected_truncated) +
+                            "), received " + std::to_string(actual_result[i]);
+            return false;
+        }
+    }
+
+    return true;
 }
 
 /**
@@ -1204,7 +1357,9 @@ void benchmark_updates(
         //{"batches", 16, 17, 8, 100, 100, false, true},
         // {"batches", 25, 26, 2, 100, 100, false, true},
         //{"batches", 25, 26, 8, 100, 100, false, true},
-        {"batches", init_build_size_log, init_probe_size_log, rounds, 200, 200, false, true},
+        // Original fixed-growth configuration:
+        // {"batches", init_build_size_log, init_probe_size_log, rounds, 200, 200, false, true},
+        {"batches", init_build_size_log, init_probe_size_log, rounds, growth_factor, growth_factor, ALTERNATE_INSERT_DELETE_ROUNDS, true},
     };
 
     // *** MAKE TRUE TRUE
@@ -1219,7 +1374,7 @@ void benchmark_updates(
         // -------------- TEMPORARAY MANUAL OVERRIDE FOR TESTING: BUILD_SIZE and PROBE_SIZE
         // --> Adjust
         size_t build_size = ( size_t{1} << tc.build_size_log ); //------->  + 333; // + 100;
-        //size_t build_size = 99999999 + 6; //100000005;
+       //size_t build_size = 99999999 + 6; //100000005;
         std::cerr << " Build Size at top of File " << build_size << " free memory: " <<    free_memory_bytes << " total mem: " << total_memory_bytes << std::endl;
         // size_t build_size = (size_t{1} << tc.build_size_log); // + 100;
         // size_t build_size = (size_t{1} << tc.build_size_log) ; // + 100;
@@ -1245,6 +1400,14 @@ void benchmark_updates(
             std::cerr << " --> Build Size at top of File " << build_size << " free memory: " <<    free_memory_bytes << " total mem: " << total_memory_bytes << std::endl;
             size_t key_generation_size = build_size * (100 + tc.total_inserts_percentage_of_build_size) / 100;
             size_t probe_size = NinetyNineMillion +2; 
+
+        #elif defined(OVERRIDE_BUILD_TO_100M)
+        #pragma message "OVERRIDE_BUILD_TO_100M is ON: Using build_size=100000005 and configured probe_size"
+
+            size_t build_size = compile_flags::override_build_size;
+            std::cerr << " --> OVERRIDE_BUILD_TO_100M: Build Size at top of File " << build_size << " free memory: " << free_memory_bytes << " total mem: " << total_memory_bytes << std::endl;
+            size_t key_generation_size = build_size * (100 + tc.total_inserts_percentage_of_build_size) / 100;
+            size_t probe_size = (size_t{1} << tc.probe_size_log);
 
         #else
         #pragma message "OVERRIDE_TO_100MILLION is OFF: Using build_size_log and probe_size_log from config"
@@ -1520,8 +1683,19 @@ void benchmark_updates(
 
                 if (step == 0)
                 {
+#ifdef SKIP_STEP0_PROBES
+                    // Strict no-step-0 mode: leave the loop before any update,
+                    // insertion warm-up, query preparation/sort, hit lookup,
+                    // miss lookup, or other benchmark kernel can execute.
+                    std::cerr
+                        << "----> step 0: STRICT SKIP -- no warm-up, update, sort, hit-query, or miss-query kernels"
+                        << std::endl;
+                    continue;
+#else
                     std::cerr << "----> step 0: No Updates Probe only" << std::endl;
+                    // Original/default behavior: proceed directly to the probe section.
                     goto probe;
+#endif
                 }
 
                 std::cerr << "----> step " << step << ": ";
@@ -1540,10 +1714,14 @@ void benchmark_updates(
                 if constexpr (supports_updates)
                 {
                     // Warm up the kernels with a dummy insert to ensure fair timing for the first real update batch
-                    if (ENABLE_DUMMY_INSERTS && step == 1 )  
+                    if (ENABLE_DUMMY_INSERTS && step == 1)
                     {
                         std::cerr << "Performing Dummy Insert Round\n";
-                        size_t dummy_insert_size = 10; // 2000;
+                        // Original insertion warm-up key selection. Retained so
+                        // experiments can restore the previous path if needed.
+                        /*
+                        // Original warm-up size: size_t dummy_insert_size = 10;
+                        size_t dummy_insert_size = insert_warmup_key_count;
                         if (dummy_insert_size > active_range_end - active_range_start)
                         {
                             dummy_insert_size = active_range_end - active_range_start; // Ensure we don't exceed available keys
@@ -1551,6 +1729,22 @@ void benchmark_updates(
                         std::vector<key_type> dummy_inserts(
                             generated_keys.begin(),
                             generated_keys.begin() + dummy_insert_size);
+                        */
+
+                        // Warm the insertion path by reinserting keys that are
+                        // already resident in the initial build. Do not consume
+                        // any key from the real insertion batches, which begin
+                        // at generated_keys[build_size].
+                        const size_t dummy_insert_size =
+                            std::min(insert_warmup_key_count, build_size);
+                        std::vector<key_type> dummy_inserts(
+                            generated_keys.begin(),
+                            generated_keys.begin() + dummy_insert_size);
+
+                        std::cerr
+                            << "Insert warm-up source: first "
+                            << dummy_insert_size
+                            << " initial build keys; real insertion keys are unchanged\n";
 
                         std::vector<smallsize> dummy_offsets(dummy_insert_size);
                         std::iota(dummy_offsets.begin(), dummy_offsets.end(), 0);
@@ -1702,6 +1896,34 @@ void benchmark_updates(
                         C2EX
                                 std::cerr
                             << "delete size: " << delete_batch_size << std::endl;
+
+                        // Warm only the first real deletion round. The warm-up
+                        // consumes a prefix of the same sorted delete list, is
+                        // excluded from insert_or_delete_time_ms, and completes
+                        // before the full timed deletion is launched.
+#ifdef ENABLE_DELETE_WARMUP
+                        if (ENABLE_DUMMY_DELETES && next_del_idx == 0)
+                        {
+                            const size_t dummy_delete_size =
+                                std::min(delete_warmup_key_count, relevant_deletes.size());
+                            if (dummy_delete_size > 0)
+                            {
+                                std::cerr << "Performing Dummy Delete Round" << std::endl;
+                                std::cerr << "Delete warm-up source: first "
+                                          << dummy_delete_size
+                                          << " keys from the first real delete list" << std::endl;
+                                std::cerr << "Dummy delete size: "
+                                          << dummy_delete_size << std::endl;
+                                index.remove(
+                                    insert_delete_keys_buffer.ptr(),
+                                    dummy_delete_size,
+                                    0);
+                                cudaDeviceSynchronize();
+                                CUERR
+                            }
+                        }
+#endif
+
                         timer.start();
                         index.remove(insert_delete_keys_buffer.ptr(), delete_batch_size, 0);
                         timer.stop();
@@ -1937,17 +2159,35 @@ void benchmark_updates(
 #endif
                         // timer.clear();
 
+                        /*
+                         * Previous query warm-up selection.  Do not restore
+                         * the 20-query path: it does not warm the same workload
+                         * as the measured full-batch lookup.
+                         *
+                         * const size_t query_hit_warmup_size =
+                         *     USE_FULL_QUERY_HIT_WARMUP
+                         *         ? probe_size
+                         *         : std::min<size_t>(20, probe_size);
+                         */
+                        const size_t query_hit_warmup_size = probe_size;
+                        if (ENABLE_QUERY_HIT_WARMUP && step == 0)
+                        {
+                            std::cerr << "Point-query hit warm-up size: "
+                                      << query_hit_warmup_size << std::endl;
+                        }
+
 #ifdef BASELINES
 #pragma message "BASELINS SORTED Lookups"
 
 #if !defined(UNSORTED_PROBES_CHECKS)
 #pragma message "Using BASELINE SORTED LOOKUP in LOOKUPS"
-                        if (step == 0) // Dummy Probe round to warm up
+                        // Original: if (step == 0)
+                        if (ENABLE_QUERY_HIT_WARMUP && step == 0) // Dummy Probe round to warm up
                         {
                             // timer.stop();
                             index.lookup(d_sorted_keys.ptr(),
                                          tmp_results_sorted.ptr(),
-                                         20, 0);
+                                         query_hit_warmup_size, 0);
                             // timer.start();
                         }
                         timer.start();
@@ -1958,12 +2198,13 @@ void benchmark_updates(
 #else
 #pragma message "Using BASELINE UNSORTED LOOKUP in LOOKUPS"
 
-                        if (step == 0) // Dummy Probe round to warm up
+                        // Original: if (step == 0)
+                        if (ENABLE_QUERY_HIT_WARMUP && step == 0) // Dummy Probe round to warm up
                         {
                             // timer.stop();
                             index.lookup(probe_keys_buffer.ptr(),
                                          result_buffer.ptr(),
-                                         20, 0);
+                                         query_hit_warmup_size, 0);
                             // timer.start();
                         }
                         timer.start();
@@ -1975,12 +2216,13 @@ void benchmark_updates(
 #else
 
 #pragma message "Using REGULAR CGRXU LOOKUPS"
-                        if (step == 0) // Dummy Probe round to warm up
+                        // Original: if (step == 0)
+                        if (ENABLE_QUERY_HIT_WARMUP && step == 0) // Dummy Probe round to warm up
                         {
                             // timer.stop();
                             index.lookups_ordered(d_sorted_keys.ptr(),
                                                   tmp_results_sorted.ptr(),
-                                                  20, 0);
+                                                  query_hit_warmup_size, 0);
                             // timer.stop();
 
                             // timer.start();
@@ -2049,6 +2291,12 @@ void benchmark_updates(
                             d_range_upper_keys.upload(range_upper_host.data(), probe_size);
                             tmp_range_results_sorted.zero();
 
+                            // Host-side only, before timer.start() -- must never sit inside
+                            // the timed region (see feedback_no_printf_in_timed_kernels).
+                            std::cerr << "Range query size (keys from low[i] to high[i]): "
+                                      << static_cast<unsigned long long>(RANGE_QUERY_SIZE)
+                                      << std::endl;
+
                             const size_t warmup_size = std::min<size_t>(20, probe_size);
                             if (step == 0 && warmup_size > 0)
                             {
@@ -2073,6 +2321,7 @@ void benchmark_updates(
                             cudaDeviceSynchronize();
                             C2EX
 
+                            /*
                             const size_t print_count = std::min<size_t>(10, probe_size);
                             const auto range_results =
                                 tmp_range_results_sorted.download(print_count);
@@ -2083,7 +2332,33 @@ void benchmark_updates(
                                 std::cerr << " " << range_results[i];
                             }
                             std::cerr << std::endl;
+                            */
 
+#ifdef VERIFY_RANGE_QUERIES
+                            {
+                                const auto all_range_results =
+                                    tmp_range_results_sorted.download(probe_size);
+                                const auto expected_range_results =
+                                    compute_expected_range_sums<key_type>(
+                                        generated_keys,
+                                        active_range_start,
+                                        active_range_end,
+                                        !supports_updates,
+                                        range_lower_host,
+                                        range_upper_host);
+
+                                if (!is_matching_range_result(
+                                        expected_range_results,
+                                        all_range_results,
+                                        error_message))
+                                {
+                                    std::cerr << " -> RANGE SKIP " << error_message << std::endl;
+                                    break;
+                                }
+
+                                std::cerr << " -> RANGE QUERY VERIFICATION CORRECT" << std::endl;
+                            }
+#endif
                         }
 #else
 #pragma message "SKIP_RANGE_QUERIES=YES"
