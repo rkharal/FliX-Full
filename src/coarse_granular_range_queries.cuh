@@ -968,6 +968,45 @@ GLOBALQUALIFIER void lookup_kernel_rq_scan_v2(
 #define RQ_V3_MIN_INTERIOR 4
 #endif
 
+
+// First bucket whose max >= key, searching forward from `hint` (a bucket known to
+// satisfy maxbuf[hint - 1] < key, e.g. the previous, smaller query's bucket):
+// exponential steps then a binary search, so nearby keys cost O(log distance)
+// dependent loads instead of O(log #buckets). Falls back to a full search when
+// the hint does not apply.
+template <typename key_type>
+DEVICEQUALIFIER smallsize find_range_bucket_galloping(
+    const key_type *__restrict__ maxbuf, key_type key, smallsize hint, smallsize pcwo)
+{
+    if (hint >= pcwo || (hint > 0 && maxbuf[hint - 1] >= key))
+        return static_cast<smallsize>(find_range_bucket_from_maxvalues<key_type>(maxbuf, key, pcwo));
+    // invariant: answer >= hint
+    if (maxbuf[hint] >= key)
+        return hint;
+    smallsize lo = hint + 1; // answer in [lo, hi]
+    smallsize step = 1;
+    smallsize hi = hint + 1;
+    while (hi < pcwo && maxbuf[hi] < key)
+    {
+        lo = hi + 1;
+        step <<= 1;
+        hi = hint + step;
+    }
+    if (hi >= pcwo)
+        hi = pcwo - 1;
+    if (lo > hi) // every bucket max < key: clamp like find_range_bucket_from_maxvalues
+        return pcwo - 1;
+    while (lo < hi)
+    {
+        const smallsize mid = lo + ((hi - lo) >> 1);
+        if (maxbuf[mid] >= key)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return lo;
+}
+
 template <typename key_type, int tile_width>
 DEVICEQUALIFIER smallsize rq_v3_scan_chain_filtered(
     const uint8_t *node, key_type lo, key_type hi, smallsize lane,
@@ -1031,6 +1070,9 @@ GLOBALQUALIFIER void lookup_kernel_rq_scan_v3(
         to_find = true;
     }
     smallsize my_result = 0;
+#ifdef RQ_V3_GALLOP
+    smallsize bucket_hint = 0; // queries are processed in sorted order within a tile
+#endif
 
     auto work_queue = tile.ballot(to_find);
     while (work_queue)
@@ -1042,8 +1084,14 @@ GLOBALQUALIFIER void lookup_kernel_rq_scan_v3(
 
         if (lo <= hi)
         {
+#ifdef RQ_V3_GALLOP
+            smallsize b = find_range_bucket_galloping<key_type>(maxbuf, lo, bucket_hint, pcwo);
+            bucket_hint = b;
+            const smallsize b_hi = find_range_bucket_galloping<key_type>(maxbuf, hi, b, pcwo);
+#else
             smallsize b = static_cast<smallsize>(find_range_bucket_from_maxvalues<key_type>(maxbuf, lo, pcwo));
             const smallsize b_hi = static_cast<smallsize>(find_range_bucket_from_maxvalues<key_type>(maxbuf, hi, pcwo));
+#endif
 
             if (b_hi >= b + 1 + RQ_V3_MIN_INTERIOR)
             {
