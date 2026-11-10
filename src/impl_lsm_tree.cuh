@@ -666,6 +666,123 @@ GLOBALQUALIFIER void lsm_collaborative_range_lookup_kernel(
     }
 }
 
+
+// -----------------------------------------------------------------------------
+// Prefix-sum range aggregation (LSM_PREFIX_RANGE_QUERIES)
+//
+// Instead of scanning every key in [lo, hi] on every level, we precompute, for
+// each level (and the staging buffer), an inclusive prefix sum over that level's
+// values (tombstones contribute 0). A range sum on one level is then
+//     prefix[u - 1] - prefix[l - 1]
+// where l = lower_bound(lo) and u = upper_bound(hi) on that level's sorted keys,
+// i.e. two binary searches and two loads per level, independent of range width.
+// Per-level results are summed across levels; this is correct because every key
+// appears at most once in the tree (deletions overwrite the value in place).
+//
+// Prefix sums are kept in 32-bit (smallsize) arithmetic, matching the 32-bit
+// result type of range_lookup_sum: modular differences give the exact sum
+// mod 2^32, i.e. the same truncated value every other variant returns.
+// -----------------------------------------------------------------------------
+
+GLOBALQUALIFIER void lsm_mask_tombstones_kernel(
+    const smallsize *values,
+    smallsize *masked,
+    size_t size)
+{
+    const size_t tid = size_t(threadIdx.x) + size_t(blockIdx.x) * blockDim.x;
+    if (tid >= size)
+        return;
+    const smallsize v = values[tid];
+    masked[tid] = (v == not_found) ? smallsize(0) : v;
+}
+
+// first index i in [0, n] with keys[i] >= x
+template <typename key_type>
+DEVICEQUALIFIER INLINEQUALIFIER smallsize lsm_lower_bound(const key_type *keys, smallsize n, key_type x)
+{
+    if (n == 0)
+        return 0;
+    smallsize base = 0;
+    while (n > 1)
+    {
+        const smallsize half = n >> 1;
+        base = (keys[base + half] < x) ? base + half : base;
+        n -= half;
+    }
+    return base + smallsize(keys[base] < x);
+}
+
+// first index i in [0, n] with keys[i] > x
+template <typename key_type>
+DEVICEQUALIFIER INLINEQUALIFIER smallsize lsm_upper_bound(const key_type *keys, smallsize n, key_type x)
+{
+    if (n == 0)
+        return 0;
+    smallsize base = 0;
+    while (n > 1)
+    {
+        const smallsize half = n >> 1;
+        base = (keys[base + half] <= x) ? base + half : base;
+        n -= half;
+    }
+    return base + smallsize(keys[base] <= x);
+}
+
+template <typename key_type>
+DEVICEQUALIFIER INLINEQUALIFIER smallsize lsm_level_prefix_range_sum(
+    const key_type *keys, const smallsize *inclusive_prefix, smallsize n, key_type lo, key_type hi)
+{
+    const smallsize l = lsm_lower_bound<key_type>(keys, n, lo);
+    // the upper bound can only lie at or after l
+    const smallsize u = l + lsm_upper_bound<key_type>(keys + l, n - l, hi);
+    if (u <= l)
+        return 0;
+    const smallsize upper_prefix = inclusive_prefix[u - 1];
+    const smallsize lower_prefix = (l > 0) ? inclusive_prefix[l - 1] : smallsize(0);
+    return upper_prefix - lower_prefix;
+}
+
+template <typename key_type, smallsize chunk_size>
+GLOBALQUALIFIER void lsm_prefix_range_lookup_kernel(
+    const key_type *level_keys,
+    const smallsize *level_prefix,
+    const key_type *staged_keys,
+    const smallsize *staged_prefix,
+    const key_type *lower_bounds,
+    const key_type *upper_bounds,
+    smallsize *results,
+    smallsize size,
+    smallsize level_count,
+    smallsize inserted_chunk_counter,
+    smallsize staged_size)
+{
+    const smallsize tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid >= size)
+        return;
+
+    const key_type lo = lower_bounds[tid];
+    const key_type hi = upper_bounds[tid];
+    smallsize result = 0;
+
+    if (lo <= hi)
+    {
+        if (staged_size > 0)
+            result += lsm_level_prefix_range_sum<key_type>(staged_keys, staged_prefix, staged_size, lo, hi);
+
+        for (smallsize k = 0; k < level_count; ++k)
+        {
+            if ((inserted_chunk_counter & (1u << k)) == 0)
+                continue;
+            const smallsize num_element_level_k = chunk_size << k;
+            const smallsize offset = num_element_level_k - chunk_size;
+            result += lsm_level_prefix_range_sum<key_type>(
+                level_keys + offset, level_prefix + offset, num_element_level_k, lo, hi);
+        }
+    }
+
+    results[tid] = result;
+}
+
 template <typename key_type, typename value_type>
 void untimed_pair_merge(
     void *temp, size_t temp_bytes,
@@ -714,6 +831,12 @@ private:
     cuda_buffer<smallsize> staging_values_buffer;
 
     cuda_buffer<uint8_t> temp_sort_buffer;
+
+    // prefix-sum range aggregation (LSM_PREFIX_RANGE_QUERIES): one inclusive
+    // prefix sum per level, stored at the same offsets as level_values_buffer
+    cuda_buffer<smallsize> level_prefix_buffer;
+    cuda_buffer<smallsize> staging_prefix_buffer;
+    cuda_buffer<uint8_t> prefix_scan_temp_buffer;
     cuda_buffer<key_type> temp_keys_buffer_a;
     cuda_buffer<smallsize> temp_values_buffer_a;
     cuda_buffer<key_type> temp_keys_buffer_b;
@@ -809,7 +932,10 @@ public:
            temp_keys_buffer_a.size_in_bytes() +
            temp_values_buffer_a.size_in_bytes() +
            temp_keys_buffer_b.size_in_bytes() +
-           temp_values_buffer_b.size_in_bytes();
+           temp_values_buffer_b.size_in_bytes() +
+           level_prefix_buffer.size_in_bytes() +
+           staging_prefix_buffer.size_in_bytes() +
+           prefix_scan_temp_buffer.size_in_bytes();
 }
 
 
@@ -858,6 +984,20 @@ public:
             C2EX
                 temp_values_buffer_b.alloc(max_level_size);
             C2EX
+#ifdef LSM_PREFIX_RANGE_QUERIES
+            level_prefix_buffer.alloc(total_available_slots);
+            C2EX
+            staging_prefix_buffer.alloc(chunk_size);
+            C2EX
+            {
+                size_t scan_temp_bytes = 0;
+                cub::DeviceScan::InclusiveSum(
+                    nullptr, scan_temp_bytes,
+                    (const smallsize *)nullptr, (smallsize *)nullptr, max_level_size);
+                prefix_scan_temp_buffer.alloc(std::max<size_t>(scan_temp_bytes, 1));
+                C2EX
+            }
+#endif
         }
 
         // we want to report only the space we actually need during build
@@ -962,6 +1102,9 @@ public:
         temp_values_buffer_a.free();
         temp_keys_buffer_b.free();
         temp_values_buffer_b.free();
+        level_prefix_buffer.free();
+        staging_prefix_buffer.free();
+        prefix_scan_temp_buffer.free();
         total_available_slots = 0;
         staged_insert_size = 0;
         inserted_chunk_counter = 0;
@@ -1006,8 +1149,57 @@ public:
         range_lookup_sum(keys, keys, result, size, stream);
     }
 
+    // Precompute one inclusive prefix sum per non-empty level (and the staging
+    // buffer). Must be re-run after any insert/remove; range_lookup_sum does so
+    // on every call so the precompute cost is always part of the measured time,
+    // matching FliX's precompute_bucket_offset_sums_kernel.
+    void precompute_level_prefix_sums(cudaStream_t stream)
+    {
+        auto scan_one = [&](const smallsize *values, smallsize *prefix, size_t n) {
+            if (n == 0)
+                return;
+            lsm_mask_tombstones_kernel<<<SDIV(n, threads_per_block), threads_per_block, 0, stream>>>(values, prefix, n);
+            size_t temp_bytes = prefix_scan_temp_buffer.size_in_bytes();
+            cub::DeviceScan::InclusiveSum(
+                prefix_scan_temp_buffer.raw_ptr, temp_bytes,
+                prefix, prefix, n, stream);
+        };
+
+        scan_one(staging_values_buffer.ptr(), staging_prefix_buffer.ptr(), staged_insert_size);
+        for (size_t k = 0; k < level_count; ++k)
+        {
+            if ((inserted_chunk_counter & (1u << k)) == 0)
+                continue;
+            const size_t num_element_level_k = chunk_size << k;
+            const size_t offset = num_element_level_k - chunk_size;
+            scan_one(level_values_buffer.ptr() + offset, level_prefix_buffer.ptr() + offset, num_element_level_k);
+        }
+    }
+
+    void range_lookup_sum_prefix(const key_type *lower, const key_type *upper, value_type *result, size_t size, cudaStream_t stream)
+    {
+        precompute_level_prefix_sums(stream);
+        lsm_prefix_range_lookup_kernel<key_type, chunk_size>
+            <<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
+                level_keys_buffer.ptr(),
+                level_prefix_buffer.ptr(),
+                staging_keys_buffer.ptr(),
+                staging_prefix_buffer.ptr(),
+                lower,
+                upper,
+                result,
+                size,
+                level_count,
+                inserted_chunk_counter,
+                staged_insert_size);
+    }
+
     void range_lookup_sum(const key_type *lower, const key_type *upper, value_type *result, size_t size, cudaStream_t stream)
     {
+#ifdef LSM_PREFIX_RANGE_QUERIES
+        range_lookup_sum_prefix(lower, upper, result, size, stream);
+        return;
+#endif
         if constexpr (cg_size_log == 0)
         {
             lsm_naive_range_lookup_kernel<key_type, chunk_size>

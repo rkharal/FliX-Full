@@ -215,7 +215,12 @@ rc::result_collector rc;
          //benchmark_updates<hashtable_warpcore<key32, 30>>(rc, runs);
         //printf("nodesize ,cachelinesize %d, %d\n", input_node_size, cache_line_size);
         // benchmark_updates<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
+#ifdef FLIX_RANGE_BENCH
+        // range-query experiments (Fig. 12) use the phased benchmark, same harness as the LSM baseline
+        benchmark_updates<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
+#else
         benchmark_updates_concurrent<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
+#endif
 #endif
        // benchmark_updates<cg_rtx_index_updates<key32, 0, 4, 50, 100>>(rc, runs);
        // benchmark_updates<cg_rtx_index_updates<key32, 10, 0, 40, 200>>(rc, runs);

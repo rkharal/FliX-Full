@@ -28,7 +28,9 @@
 
 #include <filesystem> // To check file existence
 // #include "utilities.cuh"
+#if __has_include("../../input-generation/input_generation.h")
 #include "../../input-generation/input_generation.h" // Include the correct Zipf class
+#endif
 // #include "../../input-generation/input_generation.h"  // Include the correct Zipf class
 
 // #define DEBUG_BENCHMARK_OUTPUT//
@@ -36,7 +38,9 @@
 //#define REBUILD_ON
 // #define COMBINE_INSERT_DELETE
 // #define COMPUTE_TOTALKEYS
+#ifndef ENABLE_RANGE_QUERIES
 #define SKIP_RANGE_QUERIES 1
+#endif
 //#define VERIFY_RANGE_QUERIES 1
 // Original default:
 // constexpr bool ENABLE_DUMMY_INSERTS = false;
