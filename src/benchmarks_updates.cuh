@@ -1413,6 +1413,18 @@ void benchmark_updates(
             size_t key_generation_size = build_size * (100 + tc.total_inserts_percentage_of_build_size) / 100;
             size_t probe_size = (size_t{1} << tc.probe_size_log);
 
+        #elif defined(BUILD_SIZE_EXACT)
+        // Exact (typically non-power-of-two) build size. Power-of-two build and
+        // insert-batch sizes are multiples of the LSM chunk size and leave the LSM
+        // with 1-2 levels and an empty staging buffer; a non-aligned size gives it
+        // a realistic mix of populated levels plus a partial staging buffer.
+        #pragma message "BUILD_SIZE_EXACT is ON: Using exact build_size and configured probe_size"
+
+            size_t build_size = static_cast<size_t>(BUILD_SIZE_EXACT);
+            std::cerr << " --> BUILD_SIZE_EXACT: Build Size " << build_size << " free memory: " << free_memory_bytes << " total mem: " << total_memory_bytes << std::endl;
+            size_t key_generation_size = build_size * (100 + tc.total_inserts_percentage_of_build_size) / 100;
+            size_t probe_size = (size_t{1} << tc.probe_size_log);
+
         #else
         #pragma message "OVERRIDE_TO_100MILLION is OFF: Using build_size_log and probe_size_log from config"
 
