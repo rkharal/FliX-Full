@@ -1680,12 +1680,25 @@ void benchmark_updates(
                     !tc.alternating_insert_delete && !tc.insert_before_delete && !(step < tc.batch_count + 1) ||
                     tc.alternating_insert_delete && !tc.insert_before_delete && !((step & 1) == 1);
                 bool do_delete = !do_insert;
+#ifdef SLIDING_WINDOW
+                // Sliding window / FIFO churn: every round after the build inserts
+                // the next batch and deletes the oldest live batch, so the live set
+                // stays a contiguous, constant-size slice of generated_keys.
+                if (step > tc.batch_count)
+                    break;
+                do_insert = true;
+                do_delete = true;
+#endif
 
                 // --  size_t new_active_range_end = do_insert ? active_range_end + insert_batch_size : active_range_end ;
                 // --  size_t new_active_range_start = do_delete ? active_range_start + delete_batch_size : active_range_start;
 
                 size_t new_active_range_end = do_insert ? active_range_end + insert_batch_size : active_range_end - delete_batch_size;
                 size_t new_active_range_start = do_delete ? active_range_start : active_range_start;
+#ifdef SLIDING_WINDOW
+                new_active_range_end = active_range_end + insert_batch_size;
+                new_active_range_start = active_range_start + delete_batch_size;
+#endif
 
                 size_t before_update_size = active_range_end - active_range_start;
                 size_t after_update_size = new_active_range_end - new_active_range_start;
@@ -1802,6 +1815,9 @@ void benchmark_updates(
                         index.insert(insert_delete_keys_buffer.ptr(), insert_offsets_buffer.ptr(), insert_batch_size, 0);
                         timer.stop();
                         insert_or_delete_time_ms = timer.time_ms();
+#ifdef SLIDING_WINDOW
+                        std::cerr << "    --Window Insert Time: -> " << insert_or_delete_time_ms << " ms" << std::endl;
+#endif
                         cudaDeviceSynchronize();  CUERR
                          #ifdef DEBUG_BENCHMARK_OUTPUT
                             next_free= index.allocation_buffer_next_free();
@@ -1824,6 +1840,9 @@ void benchmark_updates(
                         index.remove(insert_delete_keys_buffer.ptr(), delete_batch_size, 0);
                         timer.stop();
                         insert_or_delete_time_ms = timer.time_ms();
+#ifdef SLIDING_WINDOW
+                        std::cerr << "    --Window Delete Time: -> " << insert_or_delete_time_ms << " ms" << std::endl;
+#endif
                         cudaDeviceSynchronize();  CUERR
                         #ifdef DEBUG_BENCHMARK_OUTPUT
                             next_free= index.allocation_buffer_next_free();
@@ -1872,6 +1891,9 @@ void benchmark_updates(
                         index.insert(insert_delete_keys_buffer.ptr(), insert_offsets_buffer.ptr(), insert_batch_size, 0);
                         timer.stop();
                         insert_or_delete_time_ms = timer.time_ms();
+#ifdef SLIDING_WINDOW
+                        std::cerr << "    --Window Insert Time: -> " << insert_or_delete_time_ms << " ms" << std::endl;
+#endif
                         cudaDeviceSynchronize();
                         CUERR
 
@@ -1897,7 +1919,12 @@ void benchmark_updates(
                         // const auto [del_begin, del_end] = insert_batches[next_del_idx];
                         //  go backwards from the end
 
+#ifdef SLIDING_WINDOW
+                        const size_t del_begin = active_range_start;
+                        const size_t del_end = active_range_start + delete_batch_size;
+#else
                         const auto [del_begin, del_end] = insert_batches[insert_batches.size() - next_del_idx - 1];
+#endif
                         std::cerr << "---- Recorded delete batch " << next_del_idx
                                   << ": [" << del_begin << ", " << del_end << ")\n";
 
@@ -1944,6 +1971,9 @@ void benchmark_updates(
                         index.remove(insert_delete_keys_buffer.ptr(), delete_batch_size, 0);
                         timer.stop();
                         insert_or_delete_time_ms = timer.time_ms();
+#ifdef SLIDING_WINDOW
+                        std::cerr << "    --Window Delete Time: -> " << insert_or_delete_time_ms << " ms" << std::endl;
+#endif
                         cudaDeviceSynchronize();
                         CUERR
 #ifdef DEBUG_BENCHMARK_OUTPUT
@@ -2126,6 +2156,9 @@ void benchmark_updates(
                     std::vector<smallsize> expected_result;
 
                     // ADD in a Range of Keys to Ignore (in the)
+#ifdef SLIDING_WINDOW
+                    begin_probe_range = active_range_start; // probe only live keys
+#endif
                     draw_probes(probe_size, generated_keys, begin_probe_range, active_range_end,
                                 !supports_updates, probe_keys, expected_result);
 

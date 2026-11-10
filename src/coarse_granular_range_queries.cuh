@@ -831,6 +831,301 @@ GLOBALQUALIFIER void lookup_kernel_rq_prefix_sums(
     results[tid] = upto_upper - below_lower;
 }
 
+
+// -----------------------------------------------------------------------------
+// Naive scan v2 (NAIVE_RANGE_QUERIES_V2): still visits every key in [lo, hi],
+// like NAIVE_RANGE_QUERIES, but
+//   - one tile per *query* with a ballot work queue (as the LSM/B-tree scans
+//     do), instead of one tile per bucket serially processing every query whose
+//     lower bound falls in that bucket (load imbalance under skew);
+//   - every lane reads the node header itself (same cache line, broadcast)
+//     instead of lane 0 reading it and shuffling it out;
+//   - per-lane running sums, reduced once per query instead of once per node,
+//     and no tile.sync() per node;
+//   - tile width RQ_V2_TILE (default 32) independent of TILE_SIZE.
+// -----------------------------------------------------------------------------
+#ifndef RQ_V2_TILE
+#define RQ_V2_TILE 32
+#endif
+
+template <typename key_type, int tile_width>
+GLOBALQUALIFIER void lookup_kernel_rq_scan_v2(
+    updatable_cg_params *__restrict__ launch_params,
+    const key_type *__restrict__ lower_list,
+    const key_type *__restrict__ upper_list,
+    smallsize *__restrict__ results,
+    smallsize query_size)
+{
+    coop_g::thread_block block = coop_g::this_thread_block();
+    coop_g::thread_block_tile<tile_width> tile = coop_g::tiled_partition<tile_width>(block);
+
+    const smallsize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const smallsize lane = tile.thread_rank();
+    if ((tid - lane) >= query_size)
+        return;
+
+    const key_type *__restrict__ maxbuf = static_cast<const key_type *>(launch_params->maxvalues);
+    const smallsize pcwo = launch_params->partition_count_with_overflow;
+    const smallsize node_stride = launch_params->node_stride;
+    const smallsize allocation_count = launch_params->allocation_buffer_count;
+    const smallsize lastpos_off = get_lastposition_bytes<key_type>(launch_params->node_size);
+    const uint8_t *node_base = static_cast<const uint8_t *>(launch_params->ordered_node_pairs);
+    const uint8_t *alloc_base = static_cast<const uint8_t *>(launch_params->allocation_buffer);
+
+    key_type my_lo = 0, my_hi = 0;
+    bool to_find = false;
+    if (tid < query_size)
+    {
+        my_lo = lower_list[tid];
+        my_hi = upper_list[tid];
+        to_find = true;
+    }
+    smallsize my_result = 0;
+
+    auto work_queue = tile.ballot(to_find);
+    while (work_queue)
+    {
+        const int r = __ffs(work_queue) - 1;
+        const key_type lo = tile.shfl(my_lo, r);
+        const key_type hi = tile.shfl(my_hi, r);
+        smallsize acc = 0;
+
+        if (lo <= hi)
+        {
+            smallsize b = static_cast<smallsize>(find_range_bucket_from_maxvalues<key_type>(maxbuf, lo, pcwo));
+            const uint8_t *node = node_base + static_cast<size_t>(b) * node_stride;
+            bool done = false;
+
+            // header-only skip to the first node whose max >= lo
+            while (true)
+            {
+                if (cg::extract<key_type>((void *)node, 0) >= lo)
+                    break;
+                const smallsize next_ptr = cg::extract<smallsize>((void *)node, lastpos_off);
+                if (next_ptr != 0 && (next_ptr - 1) < allocation_count)
+                {
+                    node = alloc_base + static_cast<size_t>(next_ptr - 1) * node_stride;
+                }
+                else
+                {
+                    if (++b >= pcwo) { done = true; break; }
+                    node = node_base + static_cast<size_t>(b) * node_stride;
+                }
+            }
+
+            while (!done)
+            {
+                const key_type node_max = cg::extract<key_type>((void *)node, 0);
+                const smallsize node_count = cg::extract<smallsize>((void *)node, sizeof(key_type));
+                const smallsize next_ptr = cg::extract<smallsize>((void *)node, lastpos_off);
+
+                for (smallsize slot = lane + 1; slot <= node_count; slot += tile_width)
+                {
+                    const key_type k = extract_key_node<key_type>((void *)node, slot);
+                    if (k >= lo && k <= hi)
+                        acc += extract_offset_node<key_type>((void *)node, slot);
+                }
+
+                if (node_max >= hi)
+                    break;
+                if (next_ptr != 0 && (next_ptr - 1) < allocation_count)
+                {
+                    node = alloc_base + static_cast<size_t>(next_ptr - 1) * node_stride;
+                }
+                else
+                {
+                    if (++b >= pcwo) break;
+                    node = node_base + static_cast<size_t>(b) * node_stride;
+                }
+            }
+        }
+
+        const smallsize total = coop_g::reduce(tile, acc, coop_g::plus<smallsize>());
+        if (lane == static_cast<smallsize>(r))
+        {
+            my_result = total;
+            to_find = false;
+        }
+        work_queue = tile.ballot(to_find);
+    }
+
+    if (tid < query_size)
+        results[tid] = my_result;
+}
+
+
+// -----------------------------------------------------------------------------
+// Naive scan v3 (NAIVE_RANGE_QUERIES_V3): v2, plus bucket-parallel interiors for
+// large ranges. Still visits every key in [lo, hi] (no precomputed sums).
+// If the range spans at least RQ_V3_MIN_INTERIOR buckets strictly between the
+// buckets of lo and hi, those interior buckets are fully covered: each lane
+// walks a different interior bucket's chain (all offsets, no key compares), so
+// many independent pointer chases are in flight instead of one serial walk.
+// The two boundary buckets use the cooperative, filtered scan. Smaller ranges
+// take exactly the v2 path.
+// -----------------------------------------------------------------------------
+#ifndef RQ_V3_MIN_INTERIOR
+#define RQ_V3_MIN_INTERIOR 4
+#endif
+
+template <typename key_type, int tile_width>
+DEVICEQUALIFIER smallsize rq_v3_scan_chain_filtered(
+    const uint8_t *node, key_type lo, key_type hi, smallsize lane,
+    smallsize lastpos_off, smallsize node_stride, smallsize allocation_count,
+    const uint8_t *alloc_base)
+{
+    smallsize acc = 0;
+    while (node != nullptr)
+    {
+        const key_type node_max = cg::extract<key_type>((void *)node, 0);
+        const smallsize node_count = cg::extract<smallsize>((void *)node, sizeof(key_type));
+        const smallsize next_ptr = cg::extract<smallsize>((void *)node, lastpos_off);
+        if (node_max >= lo)
+        {
+            for (smallsize slot = lane + 1; slot <= node_count; slot += tile_width)
+            {
+                const key_type k = extract_key_node<key_type>((void *)node, slot);
+                if (k >= lo && k <= hi)
+                    acc += extract_offset_node<key_type>((void *)node, slot);
+            }
+            if (node_max >= hi)
+                break;
+        }
+        node = (next_ptr != 0 && (next_ptr - 1) < allocation_count)
+                   ? alloc_base + static_cast<size_t>(next_ptr - 1) * node_stride
+                   : nullptr;
+    }
+    return acc;
+}
+
+template <typename key_type, int tile_width>
+GLOBALQUALIFIER void lookup_kernel_rq_scan_v3(
+    updatable_cg_params *__restrict__ launch_params,
+    const key_type *__restrict__ lower_list,
+    const key_type *__restrict__ upper_list,
+    smallsize *__restrict__ results,
+    smallsize query_size)
+{
+    coop_g::thread_block block = coop_g::this_thread_block();
+    coop_g::thread_block_tile<tile_width> tile = coop_g::tiled_partition<tile_width>(block);
+
+    const smallsize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const smallsize lane = tile.thread_rank();
+    if ((tid - lane) >= query_size)
+        return;
+
+    const key_type *__restrict__ maxbuf = static_cast<const key_type *>(launch_params->maxvalues);
+    const smallsize pcwo = launch_params->partition_count_with_overflow;
+    const smallsize node_stride = launch_params->node_stride;
+    const smallsize allocation_count = launch_params->allocation_buffer_count;
+    const smallsize lastpos_off = get_lastposition_bytes<key_type>(launch_params->node_size);
+    const uint8_t *node_base = static_cast<const uint8_t *>(launch_params->ordered_node_pairs);
+    const uint8_t *alloc_base = static_cast<const uint8_t *>(launch_params->allocation_buffer);
+
+    key_type my_lo = 0, my_hi = 0;
+    bool to_find = false;
+    if (tid < query_size)
+    {
+        my_lo = lower_list[tid];
+        my_hi = upper_list[tid];
+        to_find = true;
+    }
+    smallsize my_result = 0;
+
+    auto work_queue = tile.ballot(to_find);
+    while (work_queue)
+    {
+        const int r = __ffs(work_queue) - 1;
+        const key_type lo = tile.shfl(my_lo, r);
+        const key_type hi = tile.shfl(my_hi, r);
+        smallsize acc = 0;
+
+        if (lo <= hi)
+        {
+            smallsize b = static_cast<smallsize>(find_range_bucket_from_maxvalues<key_type>(maxbuf, lo, pcwo));
+            const smallsize b_hi = static_cast<smallsize>(find_range_bucket_from_maxvalues<key_type>(maxbuf, hi, pcwo));
+
+            if (b_hi >= b + 1 + RQ_V3_MIN_INTERIOR)
+            {
+                // boundary buckets: cooperative filtered scans
+                acc += rq_v3_scan_chain_filtered<key_type, tile_width>(
+                    node_base + static_cast<size_t>(b) * node_stride, lo, hi, lane,
+                    lastpos_off, node_stride, allocation_count, alloc_base);
+                acc += rq_v3_scan_chain_filtered<key_type, tile_width>(
+                    node_base + static_cast<size_t>(b_hi) * node_stride, lo, hi, lane,
+                    lastpos_off, node_stride, allocation_count, alloc_base);
+
+                // interior buckets: one lane per bucket, whole chains, no key compares
+                for (smallsize ib = b + 1 + lane; ib < b_hi; ib += tile_width)
+                {
+                    const uint8_t *node = node_base + static_cast<size_t>(ib) * node_stride;
+                    while (true)
+                    {
+                        const smallsize node_count = cg::extract<smallsize>((void *)node, sizeof(key_type));
+                        const smallsize next_ptr = cg::extract<smallsize>((void *)node, lastpos_off);
+                        for (smallsize slot = 1; slot <= node_count; ++slot)
+                            acc += extract_offset_node<key_type>((void *)node, slot);
+                        if (next_ptr == 0 || (next_ptr - 1) >= allocation_count)
+                            break;
+                        node = alloc_base + static_cast<size_t>(next_ptr - 1) * node_stride;
+                    }
+                }
+            }
+            else
+            {
+                // small range: identical to v2
+                const uint8_t *node = node_base + static_cast<size_t>(b) * node_stride;
+                bool done = false;
+                while (true)
+                {
+                    if (cg::extract<key_type>((void *)node, 0) >= lo)
+                        break;
+                    const smallsize next_ptr = cg::extract<smallsize>((void *)node, lastpos_off);
+                    if (next_ptr != 0 && (next_ptr - 1) < allocation_count)
+                        node = alloc_base + static_cast<size_t>(next_ptr - 1) * node_stride;
+                    else
+                    {
+                        if (++b >= pcwo) { done = true; break; }
+                        node = node_base + static_cast<size_t>(b) * node_stride;
+                    }
+                }
+                while (!done)
+                {
+                    const key_type node_max = cg::extract<key_type>((void *)node, 0);
+                    const smallsize node_count = cg::extract<smallsize>((void *)node, sizeof(key_type));
+                    const smallsize next_ptr = cg::extract<smallsize>((void *)node, lastpos_off);
+                    for (smallsize slot = lane + 1; slot <= node_count; slot += tile_width)
+                    {
+                        const key_type k = extract_key_node<key_type>((void *)node, slot);
+                        if (k >= lo && k <= hi)
+                            acc += extract_offset_node<key_type>((void *)node, slot);
+                    }
+                    if (node_max >= hi)
+                        break;
+                    if (next_ptr != 0 && (next_ptr - 1) < allocation_count)
+                        node = alloc_base + static_cast<size_t>(next_ptr - 1) * node_stride;
+                    else
+                    {
+                        if (++b >= pcwo) break;
+                        node = node_base + static_cast<size_t>(b) * node_stride;
+                    }
+                }
+            }
+        }
+
+        const smallsize total = coop_g::reduce(tile, acc, coop_g::plus<smallsize>());
+        if (lane == static_cast<smallsize>(r))
+        {
+            my_result = total;
+            to_find = false;
+        }
+        work_queue = tile.ballot(to_find);
+    }
+
+    if (tid < query_size)
+        results[tid] = my_result;
+}
+
 template <typename Tile>
 DEVICEQUALIFIER unsigned long long tile_reduce_sum_ull(Tile tile, unsigned long long value)
 {

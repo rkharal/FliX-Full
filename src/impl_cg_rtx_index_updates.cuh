@@ -2985,7 +2985,21 @@ public:
         if (size == 0)
             return;
 
-#if defined(PREFIX_RANGE_QUERIES)
+#if defined(NAIVE_RANGE_QUERIES_V3)
+        {
+            const smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
+            lookup_kernel_rq_scan_v3<key_type, RQ_V2_TILE>
+                <<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
+                    launch_params_buffer.ptr(), lower, upper, result, size);
+        }
+#elif defined(NAIVE_RANGE_QUERIES_V2)
+        {
+            const smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
+            lookup_kernel_rq_scan_v2<key_type, RQ_V2_TILE>
+                <<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
+                    launch_params_buffer.ptr(), lower, upper, result, size);
+        }
+#elif defined(PREFIX_RANGE_QUERIES)
         {
             // Prefix-sum variant: precompute bucket prefix + per-node in-bucket prefix,
             // then answer each query as P(hi) - P(lo - 1) with one node scan per bound.
