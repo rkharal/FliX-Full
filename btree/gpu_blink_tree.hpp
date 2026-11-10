@@ -464,6 +464,40 @@ struct gpu_blink_tree {
     return sum;
   }
 
+  // MODIFIED: prefix-sum range aggregation support (BTREE_PREFIX_RANGE_QUERIES).
+  // Raw node storage: node i occupies pairs [i * branching_factor, (i + 1) * branching_factor).
+  const size_type* modified_root_index_ptr() const { return d_root_index_; }
+
+  pair_type* modified_raw_node_pairs() {
+    static_assert(sizeof(node_type<Key, Value, B>) == sizeof(pair_type) * branching_factor,
+                  "unexpected node layout");
+    return reinterpret_cast<pair_type*>(allocator_.get_raw_buffer());
+  }
+
+  // Per-lane contribution to P(x) = sum of values of all keys <= x: descend to the
+  // leaf whose key range contains x, then each lane contributes its value if its
+  // key <= x, and lane 0 adds the precomputed sum of all leaves before this one.
+  // The caller reduces the per-lane values across the tile.
+  template <typename tile_type, typename DeviceAllocator>
+  DEVICE_QUALIFIER value_type modified_prefix_sum_upto_lane(const Key& x,
+                                                            const tile_type& tile,
+                                                            DeviceAllocator& allocator,
+                                                            const value_type* leaf_excl_prefix) {
+    using node_type         = btree_node<pair_type, tile_type, branching_factor>;
+    auto current_node_index = *d_root_index_;
+    while (true) {
+      node_type current_node = node_type(
+          reinterpret_cast<pair_type*>(allocator.address(allocator_, current_node_index)), tile);
+      current_node.load();
+      if (current_node.is_leaf()) {
+        value_type v = current_node.modified_aggregating_get_in_range(Key(0), x);
+        if (tile.thread_rank() == 0) { v += leaf_excl_prefix[current_node_index]; }
+        return v;
+      }
+      current_node_index = current_node.find_next(x);
+    }
+  }
+
   template <typename tile_type, typename DeviceAllocator>
   DEVICE_QUALIFIER bool cooperative_erase(const Key& key,
                                           const tile_type& tile,

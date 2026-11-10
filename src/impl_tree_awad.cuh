@@ -281,6 +281,144 @@ inline void test_modified_btree() {
 */
 
 
+
+// -----------------------------------------------------------------------------
+// Prefix-sum range aggregation for the B-tree (BTREE_PREFIX_RANGE_QUERIES)
+//
+// Precompute (all inside range_lookup_sum, so it is timed):
+//   1. level-order expansion from the root: for each level, count each node's
+//      children, exclusive-scan the counts, and write the children in lane
+//      (= key) order. All leaves are at the same depth, so the last frontier is
+//      exactly the leaves in key order -- no sort needed;
+//   2. per-leaf value sums in that order, exclusive scan, scatter back so that
+//      leaf_excl_prefix[node] = sum of all values in leaves before `node`.
+// Query (one 16-lane tile per query, like the existing kernels):
+//   result = P(hi) - P(lo - 1), P(x) = leaf_excl_prefix[leaf(x)] + values of keys
+//   <= x in leaf(x), where leaf(x) is found by an ordinary root-to-leaf descent.
+// Sums are 32-bit modular, matching the 32-bit result type.
+// -----------------------------------------------------------------------------
+namespace btree_prefix {
+constexpr uint32_t node_width    = 16;
+constexpr uint32_t metadata_lane = node_width - 1;
+constexpr uint32_t leaf_bit_mask = 1u << 30;
+
+template <typename size_t_>
+GLOBALQUALIFIER void init_frontier_kernel(const size_t_* root_index, uint32_t* frontier) {
+    frontier[0] = static_cast<uint32_t>(*root_index);
+}
+
+// children per frontier node (0 for leaves); flags the level as leaf level
+template <typename pair_t>
+GLOBALQUALIFIER void count_children_kernel(const pair_t* nodes, const uint32_t* frontier, uint32_t frontier_size,
+                                           uint32_t* child_counts, uint32_t* leaf_level_flag) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= frontier_size) return;
+    const pair_t* node = nodes + size_t(frontier[i]) * node_width;
+    uint32_t count = 0;
+    if (node[metadata_lane].second & leaf_bit_mask) {
+        *leaf_level_flag = 1;
+    } else {
+        for (uint32_t lane = 0; lane < metadata_lane; ++lane)
+            count += (node[lane].first != 0xFFFFFFFFu);
+    }
+    child_counts[i] = count;
+}
+
+template <typename pair_t>
+GLOBALQUALIFIER void expand_children_kernel(const pair_t* nodes, const uint32_t* frontier, uint32_t frontier_size,
+                                            const uint32_t* child_offsets, uint32_t* next_frontier) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= frontier_size) return;
+    const pair_t* node = nodes + size_t(frontier[i]) * node_width;
+    uint32_t out = child_offsets[i];
+    for (uint32_t lane = 0; lane < metadata_lane; ++lane) {
+        const auto p = node[lane];
+        if (p.first != 0xFFFFFFFFu) next_frontier[out++] = p.second;
+    }
+}
+
+template <typename pair_t>
+GLOBALQUALIFIER void leaf_sums_in_order_kernel(const pair_t* nodes, uint32_t node_count,
+                                               const uint32_t* sorted_node_ids, smallsize* sums) {
+    const uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= node_count) return;
+    const pair_t* node = nodes + size_t(sorted_node_ids[j]) * node_width;
+    smallsize sum = 0;
+    if (node[metadata_lane].second & leaf_bit_mask) {
+        for (uint32_t lane = 0; lane < metadata_lane; ++lane) {
+            const auto p = node[lane];
+            if (p.first != 0xFFFFFFFFu) sum += p.second;
+        }
+    }
+    sums[j] = sum;
+}
+
+GLOBALQUALIFIER void scatter_prefix_kernel(uint32_t node_count, const uint32_t* sorted_node_ids,
+                                           const smallsize* excl_sorted, smallsize* leaf_excl_prefix) {
+    const uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= node_count) return;
+    leaf_excl_prefix[sorted_node_ids[j]] = excl_sorted[j];
+}
+} // namespace btree_prefix
+
+template <typename key_type, typename size_type, typename btree>
+GLOBALQUALIFIER
+void modified_prefix_range_lookup_kernel(
+    const key_type* lower_bounds,
+    const key_type* upper_bounds,
+    smallsize* results,
+    const size_type keys_count,
+    const smallsize* leaf_excl_prefix,
+    btree tree
+) {
+    auto thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+
+    auto block = cooperative_groups::this_thread_block();
+    auto tile  = cooperative_groups::tiled_partition<btree::branching_factor>(block);
+
+    if ((thread_id - tile.thread_rank()) >= keys_count) { return; }
+
+    key_type lower_bound = 0, upper_bound = 0;
+    bool to_find = false;
+    if (thread_id < keys_count) {
+        lower_bound = lower_bounds[thread_id];
+        upper_bound = upper_bounds[thread_id];
+        to_find     = true;
+    }
+
+    using allocator_type = device_allocator_context<typename btree::allocator_type>;
+    allocator_type allocator{tree.allocator_, tile};
+
+    smallsize result = 0;
+    auto work_queue = tile.ballot(to_find);
+    while (work_queue) {
+        auto cur_rank  = __ffs(work_queue) - 1;
+        auto cur_lower = tile.shfl(lower_bound, cur_rank);
+        auto cur_upper = tile.shfl(upper_bound, cur_rank);
+
+        smallsize lane_value = 0;
+        if (cur_lower <= cur_upper) {
+            lane_value = tree.modified_prefix_sum_upto_lane(cur_upper, tile, allocator, leaf_excl_prefix);
+            if (cur_lower > key_type(0)) {
+                lane_value -= tree.modified_prefix_sum_upto_lane(
+                    static_cast<key_type>(cur_lower - 1), tile, allocator, leaf_excl_prefix);
+            }
+        }
+        const smallsize cur_result =
+            cooperative_groups::reduce(tile, lane_value, cooperative_groups::plus<smallsize>());
+
+        if (cur_rank == tile.thread_rank()) {
+            result  = cur_result;
+            to_find = false;
+        }
+        work_queue = tile.ballot(to_find);
+    }
+
+    if (thread_id < keys_count) {
+        results[thread_id] = result;
+    }
+}
+
 template <typename key_type_, bool bulk_load_full = false>
 class tree_awad {
     static_assert(std::is_same<key_type_, key32>::value, "key must be 32 bits wide");
@@ -291,6 +429,15 @@ public:
 private:
     using tree_type = gpu_blink_tree<key_type, smallsize, bulk_load_full>;
     std::optional<tree_type> wrapped_tree;
+
+    // BTREE_PREFIX_RANGE_QUERIES buffers, sized for the allocator's full node capacity
+    size_t prefix_node_capacity = 0;
+    cuda_buffer<uint32_t> prefix_sort_keys_in, prefix_sort_keys_out;
+    cuda_buffer<uint32_t> prefix_node_ids_in, prefix_node_ids_out;
+    cuda_buffer<smallsize> prefix_sums_sorted;
+    cuda_buffer<smallsize> prefix_leaf_excl;
+    cuda_buffer<uint8_t> prefix_temp;
+    cuda_buffer<uint32_t> prefix_flag;
 
 public:
    static constexpr const char* name = "tree_awad";
@@ -317,7 +464,11 @@ public:
     }
 
     size_t gpu_resident_bytes() {
-        return wrapped_tree.value().compute_memory_usage_bytes();
+        return wrapped_tree.value().compute_memory_usage_bytes() +
+               prefix_sort_keys_in.size_in_bytes() + prefix_sort_keys_out.size_in_bytes() +
+               prefix_node_ids_in.size_in_bytes() + prefix_node_ids_out.size_in_bytes() +
+               prefix_sums_sorted.size_in_bytes() + prefix_leaf_excl.size_in_bytes() +
+               prefix_temp.size_in_bytes() + prefix_flag.size_in_bytes();
     }
 
     void build(const key_type* keys, size_t size, size_t max_size, size_t available_memory_bytes, double* build_time_ms, size_t* build_bytes) {
@@ -346,6 +497,20 @@ public:
         }
 
         wrapped_tree.emplace(size, max_size); C2EX
+#ifdef BTREE_PREFIX_RANGE_QUERIES
+        {
+            prefix_node_capacity = tree_type::nodes_to_allocate(size, max_size);
+            const size_t n = prefix_node_capacity;
+            prefix_sort_keys_in.alloc(n); prefix_sort_keys_out.alloc(n);
+            prefix_node_ids_in.alloc(n);  prefix_node_ids_out.alloc(n);
+            prefix_sums_sorted.alloc(n);  prefix_leaf_excl.alloc(n);
+            size_t scan_bytes = 0;
+            cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, (const smallsize*)nullptr, (smallsize*)nullptr, n);
+            prefix_temp.alloc(scan_bytes);
+            prefix_flag.alloc(1);
+            C2EX
+        }
+#endif
         {
             scoped_cuda_timer timer(0, build_time_ms);
             wrapped_tree.value().bulk_load(sorted_keys_buffer, sorted_offsets_buffer, size, true, 0);
@@ -364,6 +529,58 @@ public:
     void multi_lookup_sum(const key_type* keys, smallsize* result, size_t size, cudaStream_t stream) {}
 
     void range_lookup_sum(const key_type* lower, const key_type* upper, smallsize* result, size_t size, cudaStream_t stream) {
+#ifdef BTREE_PREFIX_RANGE_QUERIES
+        {
+            auto& tree = wrapped_tree.value();
+            // node count lives on the device (bump allocator); one small copy per batch
+            const uint32_t node_count = tree.get_num_tree_node();
+            if (node_count > prefix_node_capacity) { std::cerr << "btree prefix: node capacity exceeded" << std::endl; std::abort(); }
+            const auto* nodes = tree.modified_raw_node_pairs();
+            constexpr uint32_t tpb = 256;
+
+            // level-order expansion: the final frontier is the leaves in key order
+            uint32_t* frontier = prefix_node_ids_in.ptr();
+            uint32_t* next_frontier = prefix_node_ids_out.ptr();
+            uint32_t* counts = prefix_sort_keys_in.ptr();
+            uint32_t* offsets = prefix_sort_keys_out.ptr();
+            uint32_t* d_flag = prefix_flag.ptr();
+            btree_prefix::init_frontier_kernel<<<1, 1, 0, stream>>>(tree.modified_root_index_ptr(), frontier);
+            uint32_t frontier_size = 1;
+            size_t temp_bytes = 0;
+            while (true) {
+                cudaMemsetAsync(d_flag, 0, sizeof(uint32_t), stream);
+                const uint32_t fblocks = SDIV(frontier_size, tpb);
+                btree_prefix::count_children_kernel<<<fblocks, tpb, 0, stream>>>(
+                    nodes, frontier, frontier_size, counts, d_flag);
+                temp_bytes = prefix_temp.size_in_bytes();
+                cub::DeviceScan::ExclusiveSum(prefix_temp.raw_ptr, temp_bytes, counts, offsets, frontier_size, stream);
+                uint32_t host_vals[3];
+                cudaMemcpyAsync(&host_vals[0], d_flag, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+                cudaMemcpyAsync(&host_vals[1], offsets + frontier_size - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+                cudaMemcpyAsync(&host_vals[2], counts + frontier_size - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+                if (host_vals[0]) break; // frontier is the leaf level
+                const uint32_t next_size = host_vals[1] + host_vals[2];
+                btree_prefix::expand_children_kernel<<<fblocks, tpb, 0, stream>>>(
+                    nodes, frontier, frontier_size, offsets, next_frontier);
+                std::swap(frontier, next_frontier);
+                frontier_size = next_size;
+            }
+            const uint32_t leaf_count = frontier_size;
+            const uint32_t lblocks = SDIV(leaf_count, tpb);
+            btree_prefix::leaf_sums_in_order_kernel<<<lblocks, tpb, 0, stream>>>(
+                nodes, leaf_count, frontier, prefix_sums_sorted.ptr());
+            temp_bytes = prefix_temp.size_in_bytes();
+            cub::DeviceScan::ExclusiveSum(prefix_temp.raw_ptr, temp_bytes,
+                prefix_sums_sorted.ptr(), prefix_sums_sorted.ptr(), leaf_count, stream);
+            btree_prefix::scatter_prefix_kernel<<<lblocks, tpb, 0, stream>>>(
+                leaf_count, frontier, prefix_sums_sorted.ptr(), prefix_leaf_excl.ptr());
+
+            modified_prefix_range_lookup_kernel<<<SDIV(size, 512), 512, 0, stream>>>(
+                lower, upper, result, size, prefix_leaf_excl.ptr(), tree);
+            return;
+        }
+#endif
         modified_range_lookup_kernel<<<SDIV(size, 512), 512, 0, stream>>>(lower, upper, result, size, wrapped_tree.value());
     }
 

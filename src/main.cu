@@ -196,8 +196,13 @@ rc::result_collector rc;
         //benchmark_updates<hashtable_warpcore<key32, 80>>(rc, runs);
     #elif defined(GPU_BTREE)
         #pragma message "GPU_BTREE=YES"
+#ifdef RANGE_BENCH
+        // range-query experiments (Fig. 12) use the phased benchmark, same harness as FliX/LSM
+        benchmark_updates<tree_awad<key32, true>>(rc, runs);
+#else
         // benchmark_updates<tree_awad<key32, true>>(rc, runs);
         benchmark_updates_concurrent<tree_awad<key32, true>>(rc, runs);
+#endif
     #elif defined(LSM_TREE)
     #pragma message "LSM_TREE=YES"
         benchmark_updates<lsm_tree_ashkiani<key32, lsm_chunk_size_log>>(rc, runs);
@@ -215,7 +220,7 @@ rc::result_collector rc;
          //benchmark_updates<hashtable_warpcore<key32, 30>>(rc, runs);
         //printf("nodesize ,cachelinesize %d, %d\n", input_node_size, cache_line_size);
         // benchmark_updates<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
-#ifdef FLIX_RANGE_BENCH
+#if defined(FLIX_RANGE_BENCH) || defined(RANGE_BENCH)
         // range-query experiments (Fig. 12) use the phased benchmark, same harness as the LSM baseline
         benchmark_updates<cg_rtx_index_updates<key32, cache_line_size, input_node_size, 50>>(rc, runs);
 #else
