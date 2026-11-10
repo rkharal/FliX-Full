@@ -669,6 +669,168 @@ GLOBALQUALIFIER void lookup_kernel_tile_ordered_rq_sums(
 
 // path: gpu_range_lookup.cuh
 
+
+// -----------------------------------------------------------------------------
+// Prefix-sum range aggregation (PREFIX_RANGE_QUERIES)
+//
+// Precompute (one tile per bucket, then one device scan):
+//   bucket_prefix[b]      = sum of all offsets in buckets 0..b      (inclusive)
+//   node_excl_prefix[n]   = sum of offsets in the nodes that precede node n
+//                           in its own bucket's chain               (exclusive)
+// Node ids: a bucket's head node has id b; an overflow node at allocation
+// index i (next_ptr = i + 1) has id partition_count_with_overflow + i.
+//
+// Query (one thread per range): with P(x) = sum of offsets of keys <= x,
+//   result = P(hi) - P(lo - 1)
+//   P(x)   = bucket_prefix[b - 1] + node_excl_prefix[n] + (keys <= x in node n)
+// where b is the first bucket whose max >= x (binary search on maxvalues) and
+// n is the first node in b's chain whose max >= x (header-only walk). Nodes
+// strictly before n are covered by node_excl_prefix, so only one node's keys
+// are ever examined, independent of the range width.
+//
+// All sums are 32-bit (smallsize) modular, matching the 32-bit result type:
+// differences of prefixes give the exact sum mod 2^32.
+// -----------------------------------------------------------------------------
+
+template <typename key_type>
+GLOBALQUALIFIER void precompute_bucket_and_node_prefix_kernel(
+    updatable_cg_params *__restrict__ launch_params,
+    smallsize *__restrict__ bucket_sums,
+    smallsize *__restrict__ node_excl_prefix)
+{
+    coop_g::thread_block block = coop_g::this_thread_block();
+    coop_g::thread_block_tile<TILE_SIZE> tile = coop_g::tiled_partition<TILE_SIZE>(block);
+
+    const int tiles_per_block = blockDim.x / tile.size();
+    const int tile_id = blockIdx.x * tiles_per_block + tile.meta_group_rank();
+    const smallsize lane = tile.thread_rank();
+
+    const smallsize partition_count_with_overflow = launch_params->partition_count_with_overflow;
+    if (tile_id >= partition_count_with_overflow)
+        return;
+
+    const smallsize node_stride = launch_params->node_stride;
+    const smallsize node_size = launch_params->node_size;
+    const smallsize allocation_count = launch_params->allocation_buffer_count;
+    const smallsize lastpos_off = get_lastposition_bytes<key_type>(node_size);
+
+    void *curr_node =
+        static_cast<uint8_t *>(launch_params->ordered_node_pairs) +
+        static_cast<size_t>(tile_id) * static_cast<size_t>(node_stride);
+    smallsize node_id = static_cast<smallsize>(tile_id);
+
+    smallsize running = 0; // sum of the nodes before curr_node in this bucket
+
+    while (true)
+    {
+        const smallsize curr_size = cg::extract<smallsize>(curr_node, sizeof(key_type));
+
+        smallsize lane_sum = 0;
+        for (smallsize slot = lane + 1; slot <= curr_size; slot += tile.size())
+            lane_sum += extract_offset_node<key_type>(curr_node, slot);
+
+        const smallsize node_sum = coop_g::reduce(tile, lane_sum, coop_g::plus<smallsize>());
+
+        smallsize next_ptr = 0;
+        if (lane == 0)
+        {
+            node_excl_prefix[node_id] = running;
+            next_ptr = cg::extract<smallsize>(curr_node, lastpos_off);
+        }
+        running += node_sum;
+        next_ptr = tile.shfl(next_ptr, 0);
+
+        if (next_ptr == 0 || (next_ptr - 1) >= allocation_count)
+            break;
+
+        curr_node = static_cast<uint8_t *>(launch_params->allocation_buffer) +
+                    (static_cast<size_t>(next_ptr) - 1) * static_cast<size_t>(node_stride);
+        node_id = partition_count_with_overflow + (next_ptr - 1);
+    }
+
+    if (lane == 0)
+        bucket_sums[tile_id] = running;
+}
+
+// sum of offsets of all keys <= x
+template <typename key_type>
+DEVICEQUALIFIER smallsize flix_prefix_sum_upto(
+    updatable_cg_params *__restrict__ launch_params,
+    const key_type *__restrict__ maxbuf,
+    const smallsize *__restrict__ bucket_prefix,
+    const smallsize *__restrict__ node_excl_prefix,
+    smallsize partition_count_with_overflow,
+    smallsize lastpos_off,
+    key_type x)
+{
+    const int b = find_range_bucket_from_maxvalues<key_type>(maxbuf, x, partition_count_with_overflow);
+    if (b < 0)
+        return 0;
+
+    const smallsize node_stride = launch_params->node_stride;
+    const smallsize allocation_count = launch_params->allocation_buffer_count;
+
+    const uint8_t *curr_node =
+        static_cast<const uint8_t *>(launch_params->ordered_node_pairs) +
+        static_cast<size_t>(b) * static_cast<size_t>(node_stride);
+    smallsize node_id = static_cast<smallsize>(b);
+
+    // header-only walk to the first node whose max >= x (or the last node)
+    while (cg::extract<key_type>(curr_node, 0) < x)
+    {
+        const smallsize next_ptr = cg::extract<smallsize>(curr_node, lastpos_off);
+        if (next_ptr == 0 || (next_ptr - 1) >= allocation_count)
+            break;
+        curr_node = static_cast<const uint8_t *>(launch_params->allocation_buffer) +
+                    (static_cast<size_t>(next_ptr) - 1) * static_cast<size_t>(node_stride);
+        node_id = partition_count_with_overflow + (next_ptr - 1);
+    }
+
+    smallsize sum = (b > 0 ? bucket_prefix[b - 1] : smallsize(0)) + node_excl_prefix[node_id];
+
+    const smallsize curr_size = cg::extract<smallsize>(curr_node, sizeof(key_type));
+    for (smallsize slot = 1; slot <= curr_size; ++slot)
+    {
+        if (extract_key_node<key_type>((void *)curr_node, slot) <= x)
+            sum += extract_offset_node<key_type>((void *)curr_node, slot);
+    }
+    return sum;
+}
+
+template <typename key_type>
+GLOBALQUALIFIER void lookup_kernel_rq_prefix_sums(
+    updatable_cg_params *__restrict__ launch_params,
+    const key_type *__restrict__ lowest_list,
+    const key_type *__restrict__ highest_list,
+    const smallsize *__restrict__ bucket_prefix,
+    const smallsize *__restrict__ node_excl_prefix,
+    smallsize *__restrict__ results,
+    smallsize query_size)
+{
+    const smallsize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= query_size)
+        return;
+
+    const key_type lower = lowest_list[tid];
+    const key_type upper = highest_list[tid];
+    if (lower > upper)
+    {
+        results[tid] = 0;
+        return;
+    }
+
+    const key_type *__restrict__ maxbuf = static_cast<const key_type *>(launch_params->maxvalues);
+    const smallsize pcwo = launch_params->partition_count_with_overflow;
+    const smallsize lastpos_off = get_lastposition_bytes<key_type>(launch_params->node_size);
+
+    const smallsize upto_upper = flix_prefix_sum_upto<key_type>(
+        launch_params, maxbuf, bucket_prefix, node_excl_prefix, pcwo, lastpos_off, upper);
+    const smallsize below_lower = (lower == key_type(0)) ? smallsize(0) : flix_prefix_sum_upto<key_type>(
+        launch_params, maxbuf, bucket_prefix, node_excl_prefix, pcwo, lastpos_off, static_cast<key_type>(lower - 1));
+
+    results[tid] = upto_upper - below_lower;
+}
+
 template <typename Tile>
 DEVICEQUALIFIER unsigned long long tile_reduce_sum_ull(Tile tile, unsigned long long value)
 {

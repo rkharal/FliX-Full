@@ -1552,6 +1552,9 @@ private:
 
     cuda_buffer<smallsize> bucket_values_buffer;
     cuda_buffer<smallsize> range_query_sums_buffer;
+    // PREFIX_RANGE_QUERIES: per-node exclusive prefix within its bucket, and cub scan scratch
+    cuda_buffer<smallsize> range_query_node_prefix_buffer;
+    cuda_buffer<uint8_t> range_query_scan_temp_buffer;
 
     // add a buffer for static tree
     //  Meta data
@@ -2982,7 +2985,48 @@ public:
         if (size == 0)
             return;
 
-#ifdef DUP_RANGE_QUERIES
+#if defined(PREFIX_RANGE_QUERIES)
+        {
+            // Prefix-sum variant: precompute bucket prefix + per-node in-bucket prefix,
+            // then answer each query as P(hi) - P(lo - 1) with one node scan per bound.
+            const size_t pcwo = partition_count_with_overflow;
+            const size_t node_ids = pcwo + allocation_buffer.size_in_bytes() / node_stride;
+
+            if (range_query_sums_buffer.num_elements < pcwo)
+                range_query_sums_buffer.resize(pcwo);
+            if (range_query_node_prefix_buffer.num_elements < node_ids)
+                range_query_node_prefix_buffer.resize(node_ids);
+
+            size_t scan_temp_bytes = 0;
+            cub::DeviceScan::InclusiveSum(
+                nullptr, scan_temp_bytes,
+                range_query_sums_buffer.ptr(), range_query_sums_buffer.ptr(), pcwo, stream);
+            if (range_query_scan_temp_buffer.size_in_bytes() < scan_temp_bytes)
+                range_query_scan_temp_buffer.resize(scan_temp_bytes);
+
+            const smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
+            const smallsize bucket_blocks = SDIV(pcwo * TILE_SIZE, threads_per_block);
+            precompute_bucket_and_node_prefix_kernel<key_type>
+                <<<bucket_blocks, threads_per_block, 0, stream>>>(
+                    launch_params_buffer.ptr(),
+                    range_query_sums_buffer.ptr(),
+                    range_query_node_prefix_buffer.ptr());
+
+            cub::DeviceScan::InclusiveSum(
+                range_query_scan_temp_buffer.raw_ptr, scan_temp_bytes,
+                range_query_sums_buffer.ptr(), range_query_sums_buffer.ptr(), pcwo, stream);
+
+            lookup_kernel_rq_prefix_sums<key_type>
+                <<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
+                    launch_params_buffer.ptr(),
+                    lower,
+                    upper,
+                    range_query_sums_buffer.ptr(),
+                    range_query_node_prefix_buffer.ptr(),
+                    result,
+                    size);
+        }
+#elif defined(DUP_RANGE_QUERIES)
         // Parallel per-bucket ownership variant (process_lookup_tile_bulk_ordered_dup_rq):
         // every tile scans for queries overlapping its own bucket and atomicAdd's its
         // partial sum into result, instead of one tile owning a query end-to-end.
@@ -3113,6 +3157,8 @@ public:
         tree_buffer.free();
         bucket_values_buffer.free();
         range_query_sums_buffer.free();
+        range_query_node_prefix_buffer.free();
+        range_query_scan_temp_buffer.free();
         // copy_update_list.free();
         // copy_offset_list.free();
     }
