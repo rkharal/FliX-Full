@@ -63,3 +63,4 @@ backup*/
 KEEP_benchmarks_updates/
 backup*/
 /concurrent/
+/build_*/
