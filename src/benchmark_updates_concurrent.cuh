@@ -402,7 +402,8 @@ void warm_up_insertions(const std::vector<typename Index::key_type>& pool) {
     values.upload(host_values.data(), count);
     tasks.upload(host_tasks.data(), count);
     results.upload(initial_results.data(), count);
-    temporary_index.mixed_batch(keys.ptr(), values.ptr(), tasks.ptr(), results.ptr(), count, 0);
+    // Original call: temporary_index.mixed_batch(keys.ptr(), values.ptr(), tasks.ptr(), results.ptr(), count, 0);
+    temporary_index.mixed_batch(keys.ptr(), values.ptr(), tasks.ptr(), results.ptr(), count, 0, 0);
     cudaDeviceSynchronize();
     C2EX
     validate_results(operations, results.download(count), false);
@@ -411,7 +412,8 @@ void warm_up_insertions(const std::vector<typename Index::key_type>& pool) {
     std::fill(host_tasks.begin(), host_tasks.end(), lookup);
     tasks.upload(host_tasks.data(), count);
     results.upload(initial_results.data(), count);
-    temporary_index.mixed_batch(keys.ptr(), values.ptr(), tasks.ptr(), results.ptr(), count, 0);
+    // Original call: temporary_index.mixed_batch(keys.ptr(), values.ptr(), tasks.ptr(), results.ptr(), count, 0);
+    temporary_index.mixed_batch(keys.ptr(), values.ptr(), tasks.ptr(), results.ptr(), count, 0, 0);
     cudaDeviceSynchronize();
     C2EX
     validate_results(operations, results.download(count), true);
@@ -492,8 +494,10 @@ void run(rc::result_collector& collector, size_t runs) {
         std::stable_sort(warmup.begin(), warmup.end(),
                          [](const auto& a, const auto& b) { return a.key < b.key; });
         batch.upload(warmup);
+        // Original call: index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
+        //                                  batch.results.ptr(), warmup.size(), 0);
         index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
-                          batch.results.ptr(), warmup.size(), 0);
+                          batch.results.ptr(), warmup.size(), 0, 0);
         cudaDeviceSynchronize();
         C2EX
         validate_results(warmup, batch.results.download(warmup.size()), false);
@@ -515,8 +519,10 @@ void run(rc::result_collector& collector, size_t runs) {
             cudaDeviceSynchronize();
             C2EX
             timer.start();
+            // Original call: index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
+            //                                  batch.results.ptr(), operations.size(), 0);
             index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
-                              batch.results.ptr(), operations.size(), 0);
+                              batch.results.ptr(), operations.size(), 0, round + 1);
             timer.stop();
             const double kernel_ms = timer.time_ms();
             C2EX
@@ -528,8 +534,10 @@ void run(rc::result_collector& collector, size_t runs) {
             std::vector<uint8_t> lookup_tasks(operations.size(), lookup);
             batch.tasks.upload(lookup_tasks.data(), lookup_tasks.size());
             batch.reset_results(operations.size());
+            // Original call: index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
+            //                                  batch.results.ptr(), operations.size(), 0);
             index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
-                              batch.results.ptr(), operations.size(), 0);
+                              batch.results.ptr(), operations.size(), 0, round + 1);
             cudaDeviceSynchronize();
             C2EX
             validate_results(operations, batch.results.download(operations.size()), true);
@@ -729,8 +737,10 @@ void run_small_build(rc::result_collector& collector, size_t runs) {
         std::stable_sort(warmup.begin(), warmup.end(),
                          [](const auto& a, const auto& b) { return a.key < b.key; });
         batch.upload(warmup);
+        // Original call: index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
+        //                                  batch.results.ptr(), warmup.size(), 0);
         index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
-                          batch.results.ptr(), warmup.size(), 0);
+                          batch.results.ptr(), warmup.size(), 0, 0);
         cudaDeviceSynchronize();
         C2EX
         validate_results(warmup, batch.results.download(warmup.size()), false);
@@ -752,8 +762,10 @@ void run_small_build(rc::result_collector& collector, size_t runs) {
             cudaDeviceSynchronize();
             C2EX
             timer.start();
+            // Original call: index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
+            //                                  batch.results.ptr(), operations.size(), 0);
             index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
-                              batch.results.ptr(), operations.size(), 0);
+                              batch.results.ptr(), operations.size(), 0, round + 1);
             timer.stop();
             const double kernel_ms = timer.time_ms();
             C2EX
@@ -765,8 +777,10 @@ void run_small_build(rc::result_collector& collector, size_t runs) {
             std::vector<uint8_t> lookup_tasks(operations.size(), lookup);
             batch.tasks.upload(lookup_tasks.data(), lookup_tasks.size());
             batch.reset_results(operations.size());
+            // Original call: index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
+            //                                  batch.results.ptr(), operations.size(), 0);
             index.mixed_batch(batch.keys.ptr(), batch.values.ptr(), batch.tasks.ptr(),
-                              batch.results.ptr(), operations.size(), 0);
+                              batch.results.ptr(), operations.size(), 0, round + 1);
             cudaDeviceSynchronize();
             C2EX
             validate_results(operations, batch.results.download(operations.size()), true);

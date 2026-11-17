@@ -406,7 +406,8 @@ public:
     // Fully concurrent mixed batch: one kernel, each thread performs the operation in tasks[]
     // (see slab_task). values is read for inserts; result is written for every
     // operation (insert/delete: 1 success, 0 failure; lookup: value or not_found).
-    void mixed_batch(const key_type* keys, const smallsize* values, const uint8_t* tasks, smallsize* result, size_t size, cudaStream_t stream) {
+    void mixed_batch(const key_type* keys, const smallsize* values, const uint8_t* tasks, smallsize* result, size_t size, cudaStream_t stream, size_t round_number = 0) {
+        (void)round_number; // Same API as FliX; SlabHash does not use round numbers.
         hashtable_slab_mixed_kernel<key_type, table_context_type, allocator_context_type><<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
             keys,
             values,

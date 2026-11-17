@@ -1277,6 +1277,105 @@ GLOBALQUALIFIER void precompute_bucket_offset_sums_kernel(
     }
 }
 
+// Separate prefix-sum path. Existing range kernels above remain unchanged.
+// Keep totals wide before scanning: widening a 32-bit bucket sum afterwards
+// would already have lost any carry. Reuse the existing node traversal and
+// cooperative reduction helpers.
+template <typename key_type>
+GLOBALQUALIFIER void precompute_bucket_offset_sums_u64_kernel(
+    updatable_cg_params *__restrict__ launch_params,
+    bigsize *__restrict__ bucket_offset_sums)
+{
+    coop_g::thread_block block = coop_g::this_thread_block();
+    coop_g::thread_block_tile<TILE_SIZE> tile =
+        coop_g::tiled_partition<TILE_SIZE>(block);
+    const size_t bucket = static_cast<size_t>(blockIdx.x) *
+                              (blockDim.x / tile.size()) +
+                          tile.meta_group_rank();
+    if (bucket >= launch_params->partition_count_with_overflow)
+        return;
+
+    const smallsize lane = tile.thread_rank();
+    const smallsize lastpos_off =
+        get_lastposition_bytes<key_type>(launch_params->node_size);
+    void *node = get_bucket_head_node<key_type>(
+        launch_params, static_cast<smallsize>(bucket));
+    unsigned long long bucket_sum = 0;
+
+    while (node != nullptr)
+    {
+        const smallsize count = cg::extract<smallsize>(node, sizeof(key_type));
+        unsigned long long lane_sum = 0;
+        for (smallsize slot = lane + 1; slot <= count; slot += tile.size())
+            lane_sum += static_cast<unsigned long long>(
+                extract_offset_node<key_type>(node, slot));
+
+        const unsigned long long node_sum = tile_reduce_sum_ull(tile, lane_sum);
+        if (lane == 0)
+            bucket_sum += node_sum;
+
+        // Only the owner loads the next link; all lanes take the same walk.
+        if (lane == 0)
+            node = get_next_range_node<key_type>(
+                launch_params, node, lastpos_off, static_cast<smallsize>(bucket));
+        uintptr_t next = reinterpret_cast<uintptr_t>(node);
+        next = tile.shfl(next, 0);
+        node = reinterpret_cast<void *>(next);
+    }
+
+    if (lane == 0)
+        bucket_offset_sums[bucket] = static_cast<bigsize>(bucket_sum);
+}
+
+// One independent thread per query, with inclusive key bounds [lower, upper].
+// prefix[0] = 0; prefix[b + 1] contains the sum of buckets [0, b].
+// Thus strictly interior buckets cost two reads, independent of range length.
+template <typename key_type>
+GLOBALQUALIFIER void lookup_kernel_range_prefix_sums(
+    updatable_cg_params *__restrict__ launch_params,
+    const key_type *__restrict__ lower_list,
+    const key_type *__restrict__ upper_list,
+    const bigsize *__restrict__ bucket_prefix_sums,
+    bigsize *__restrict__ results,
+    smallsize query_size)
+{
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= query_size)
+        return;
+
+    const key_type lower = lower_list[tid];
+    const key_type upper = upper_list[tid];
+    const smallsize bucket_count = launch_params->partition_count_with_overflow;
+    if (lower > upper || bucket_count == 0)
+    {
+        results[tid] = 0;
+        return;
+    }
+
+    const key_type *maxbuf = static_cast<const key_type *>(launch_params->maxvalues);
+    const int first = find_range_bucket_from_maxvalues<key_type>(maxbuf, lower, bucket_count);
+    const int last = find_range_bucket_from_maxvalues<key_type>(maxbuf, upper, bucket_count);
+    const smallsize query_index = static_cast<smallsize>(tid);
+
+    if (first == last)
+    {
+        results[tid] = static_cast<bigsize>(
+            sum_offsets_in_bucket_range_single_thread<key_type>(
+                launch_params, static_cast<smallsize>(first), lower, upper, query_index));
+        return;
+    }
+
+    bigsize sum = static_cast<bigsize>(
+        sum_offsets_in_bucket_range_single_thread<key_type>(
+            launch_params, static_cast<smallsize>(first), lower, maxbuf[first], query_index));
+    sum += bucket_prefix_sums[last] - bucket_prefix_sums[first + 1];
+    const key_type last_bucket_min = maxbuf[last - 1] + static_cast<key_type>(1);
+    sum += static_cast<bigsize>(
+        sum_offsets_in_bucket_range_single_thread<key_type>(
+            launch_params, static_cast<smallsize>(last), last_bucket_min, upper, query_index));
+    results[tid] = sum;
+}
+
 /*
 template <typename key_type>
 void precompute_bucket_offset_sums(cudaStream_t stream, smallsize partition_count_with_overflow)

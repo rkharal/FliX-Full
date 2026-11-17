@@ -600,7 +600,8 @@ public:
     // (see awad_task). values is read for inserts; result is written for every
     // operation (insert/delete: 1 success, 0 failure; lookup: value or not_found).
     // void mixed_batch(const key_type* keys, const smallsize* values, const key_type* upper_bounds, const uint8_t* tasks, smallsize* result, size_t size, cudaStream_t stream) {
-    void mixed_batch(const key_type* keys, const smallsize* values, const uint8_t* tasks, smallsize* result, size_t size, cudaStream_t stream) {
+    void mixed_batch(const key_type* keys, const smallsize* values, const uint8_t* tasks, smallsize* result, size_t size, cudaStream_t stream, size_t round_number = 0) {
+        (void)round_number; // Same API as FliX; B-tree does not use round numbers.
         modified_mixed_kernel<<<SDIV(size, 512), 512, 0, stream>>>(keys, values, tasks, result, size, wrapped_tree.value());
     }
 

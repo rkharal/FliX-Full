@@ -26,11 +26,8 @@
 #include "coarse_granular_lookups_tile.cuh"
 #include "coarse_granular_lookups_tile_bulk.cuh"
 #include "coarse_granular_range_queries.cuh"
+#include <cub/device/device_scan.cuh>
 // #include "coarse_granular_lookups_tile.cuh"
-
-#ifdef MIXED_OPERATION_BATCHES
-#include "coarse_granular_mixed_update_queries.cuh"
-#endif
 
 // The separate-task mixed_batch API is available without enabling the legacy
 // MSB-encoded benchmark. The header guard preserves the existing include path.
@@ -1236,6 +1233,9 @@ GLOBALQUALIFIER void setup_bucket_only_build_data(
     smallsize node_size,
     // void *copy_buffer,
     smallsize *reuse_list_buffer,
+#ifdef FLIX_MIXED_REUSE_NODES
+    smallsize *temp_reuse_list_buffer,
+#endif
     smallsize partition_count,
     smallsize partition_count_with_overflow,
     smallsize extra_allocated_nodes)
@@ -1262,6 +1262,10 @@ GLOBALQUALIFIER void setup_bucket_only_build_data(
     launch_params->allocation_buffer_count = extra_allocated_nodes;
     launch_params->reuse_list_count = 0;
     launch_params->reuse_list = reuse_list_buffer;
+#ifdef FLIX_MIXED_REUSE_NODES
+    launch_params->temp_reuse_count = 0;
+    launch_params->temp_reuse_list = temp_reuse_list_buffer;
+#endif
 }
 
 template <typename key_type>
@@ -1452,109 +1456,22 @@ private:
     cuda_buffer<uint8_t> copy_buffer;
     cuda_buffer<key_type> maxvalues_buffer;
     cuda_buffer<smallsize> reuse_list_buffer;
-
 #ifdef FLIX_MIXED_REUSE_NODES
-    cuda_buffer<smallsize> mixed_ready_reuse_buffer;
-    cuda_buffer<smallsize> mixed_temp_reuse_buffer;
-    cuda_buffer<flix_mixed_reuse_state> mixed_reuse_state_buffer;
-    bool mixed_reuse_initialized = false;
-    unsigned int mixed_reuse_blocks = 0;
-
-    static void mixed_reuse_check_cuda(cudaError_t status, const char *operation)
-    {
-        if (status != cudaSuccess)
-            throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
-    }
-
-    void initialize_mixed_reuse(cudaStream_t stream)
-    {
-        constexpr smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
-        static_assert(threads_per_block >= 1 && threads_per_block <= MAXBLOCKSIZE,
-                      "FliX mixed batches require a valid block size");
-#ifdef FLIX_MIXED_SINGLE_THREADED
-        static_assert(node_size >= 2, "FliX scalar mixed batches require node_size >= 2");
-        const void *kernel = reinterpret_cast<const void *>(flix_mixed_batch_kernel_single_threaded_reuse<key_type>);
-        constexpr smallsize owners_per_block = threads_per_block;
-#else
-        static_assert(TILE_SIZE == 16 || TILE_SIZE == 32,
-                      "FliX tiled mixed batches require 16- or 32-lane tiles");
-        static_assert(node_size >= 2 && TILE_SIZE >= node_size,
-                      "FliX tiled mixed batches require 2 <= node_size <= TILE_SIZE");
-        static_assert(threads_per_block >= TILE_SIZE && threads_per_block % TILE_SIZE == 0,
-                      "FliX tiled mixed batches require whole tiles per block");
-        const void *kernel = reinterpret_cast<const void *>(flix_mixed_batch_kernel_tiled_reuse<key_type>);
-        constexpr smallsize owners_per_block = threads_per_block / TILE_SIZE;
+    cuda_buffer<smallsize> temp_reuse_list_buffer;
 #endif
-        int device = 0, supported = 0, sms = 0, active = 0;
-        mixed_reuse_check_cuda(cudaGetDevice(&device), "Get mixed-batch device");
-        mixed_reuse_check_cuda(cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, device), "Check cooperative support");
-        if (!supported)
-            throw std::runtime_error("FLIX_MIXED_REUSE_NODES requires cooperative launch support");
-        mixed_reuse_check_cuda(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device), "Get multiprocessor count");
-        mixed_reuse_check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, kernel, threads_per_block, 0), "Get cooperative occupancy");
-        const size_t needed = (static_cast<size_t>(partition_count_with_overflow) + owners_per_block - 1) / owners_per_block;
-        const size_t resident = static_cast<size_t>(active) * sms;
-        if (needed == 0 || resident == 0)
-            throw std::runtime_error("No resident cooperative mixed-batch grid is available");
-        mixed_reuse_blocks = static_cast<unsigned int>(std::min(needed, resident));
 
-        // One-time setup for this built layout. Later calls remain asynchronous.
-        mixed_reuse_check_cuda(cudaStreamSynchronize(stream), "Initialize mixed reuse buffers");
-        updatable_cg_params params = launch_params_buffer.download_first_item();
-        const size_t capacity = params.allocation_buffer_count;
-        const size_t storage = std::max(capacity, size_t{1});
-        smallsize previous_count = 0;
-        smallsize *previous_list = nullptr;
-        if (params.reuse_list == reuse_list_buffer.ptr() && reuse_list_buffer.ptr() != nullptr) {
-            previous_count = params.reuse_list_count;
-            previous_list = params.reuse_list;
-            if (previous_count > capacity || previous_count > reuse_list_buffer.num_elements)
-                throw std::runtime_error("Invalid existing FliX reuse-list size");
-        }
-        if (mixed_ready_reuse_buffer.num_elements != storage) mixed_ready_reuse_buffer.resize(storage);
-        if (mixed_temp_reuse_buffer.num_elements != storage) mixed_temp_reuse_buffer.resize(storage);
-        if (mixed_reuse_state_buffer.num_elements != 1) mixed_reuse_state_buffer.resize(1);
-        if (!mixed_ready_reuse_buffer.ptr() || !mixed_temp_reuse_buffer.ptr() || !mixed_reuse_state_buffer.ptr())
-            throw std::runtime_error("Failed to allocate FliX mixed reuse buffers");
-        if (previous_count != 0)
-            mixed_reuse_check_cuda(cudaMemcpyAsync(mixed_ready_reuse_buffer.ptr(), previous_list,
-                static_cast<size_t>(previous_count) * sizeof(smallsize), cudaMemcpyDeviceToDevice, stream), "Preserve reusable nodes");
-        flix_mixed_reuse_state state{};
-        state.temp_reuse_list = mixed_temp_reuse_buffer.ptr();
-        state.temp_capacity = params.allocation_buffer_count;
-        state.reuse_capacity = params.allocation_buffer_count;
-        params.reuse_list = mixed_ready_reuse_buffer.ptr();
-        params.reuse_list_count = previous_count;
-        mixed_reuse_check_cuda(cudaMemcpyAsync(mixed_reuse_state_buffer.ptr(), &state, sizeof(state), cudaMemcpyHostToDevice, stream), "Initialize reuse metadata");
-        mixed_reuse_check_cuda(cudaMemcpyAsync(launch_params_buffer.ptr(), &params, sizeof(params), cudaMemcpyHostToDevice, stream), "Bind mixed reuse list");
-        mixed_reuse_check_cuda(cudaStreamSynchronize(stream), "Complete mixed reuse initialization");
-        mixed_reuse_initialized = true;
-    }
-
-    void launch_mixed_reuse(const key_type *keys, const smallsize *values,
-                            const uint8_t *tasks, smallsize *result,
-                            smallsize count, cudaStream_t stream)
-    {
-        if (!mixed_reuse_initialized) initialize_mixed_reuse(stream);
-        constexpr smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
-        auto *params = launch_params_buffer.ptr();
-        auto *state = mixed_reuse_state_buffer.ptr();
-        void *arguments[] = {&params, &state, &keys, &values, &tasks, &result, &count};
-#ifdef FLIX_MIXED_SINGLE_THREADED
-        const void *kernel = reinterpret_cast<const void *>(flix_mixed_batch_kernel_single_threaded_reuse<key_type>);
-#else
-        const void *kernel = reinterpret_cast<const void *>(flix_mixed_batch_kernel_tiled_reuse<key_type>);
-#endif
-        mixed_reuse_check_cuda(cudaLaunchCooperativeKernel(kernel, dim3(mixed_reuse_blocks),
-            dim3(threads_per_block), arguments, 0, stream), "Launch cooperative FliX mixed batch");
-    }
-#endif // FLIX_MIXED_REUSE_NODES
 
     cuda_buffer<smallsize> bucket_values_buffer;
     cuda_buffer<smallsize> range_query_sums_buffer;
     // PREFIX_RANGE_QUERIES: per-node exclusive prefix within its bucket, and cub scan scratch
     cuda_buffer<smallsize> range_query_node_prefix_buffer;
     cuda_buffer<uint8_t> range_query_scan_temp_buffer;
+
+    // Separate storage for the opt-in 64-bit prefix path. cuda_buffer owns and
+    // releases these allocations; the original range-sum buffer is untouched.
+    cuda_buffer<bigsize> range_prefix_bucket_sums_buffer;
+    cuda_buffer<bigsize> range_prefix_sums_buffer;
+    cuda_buffer<uint8_t> range_prefix_scan_storage_buffer;
 
     // add a buffer for static tree
     //  Meta data
@@ -1821,9 +1738,6 @@ public:
     // void build(const key_type *keys, size_t keysize, double *build_time_ms, size_t *build_bytes)
     void build_bucket_layer_only(const key_type *keys, size_t size, size_t max_size, size_t available_memory_bytes, double *build_time_ms, size_t *build_bytes)
     {
-#ifdef FLIX_MIXED_REUSE_NODES
-        mixed_reuse_initialized = false;
-#endif
         // DEBUG_BUILD_PARAMS("START BUILD: Fill Size", 1, keysize);
         smallsize tile_size = TILE_SIZE;
         smallsize warp_size = WARP_SIZE;
@@ -1912,6 +1826,12 @@ public:
         */
 
 
+#ifdef FLIX_MIXED_REUSE_NODES
+        temp_reuse_list_buffer.alloc(partition_count_with_overflow);
+        C2EX
+        temp_reuse_list_buffer.zero();
+        C2EX
+#endif
         setup_bucket_only_build_data<key_type><<<1, 1, 0, 0>>>(
             launch_params_buffer.ptr(),
             ordered_node_pairs_buffer.ptr(),
@@ -1922,6 +1842,9 @@ public:
             partition_size,
             node_size,
             reuse_list_buffer.ptr(),
+#ifdef FLIX_MIXED_REUSE_NODES
+            temp_reuse_list_buffer.ptr(),
+#endif
             partition_count,
             partition_count_with_overflow,
             total_allocation_region_nodes);
@@ -1934,9 +1857,6 @@ public:
 
     void rebuild_bucket_layer_only(double *build_time_ms, size_t *build_bytes)
     {
-#ifdef FLIX_MIXED_REUSE_NODES
-        mixed_reuse_initialized = false;
-#endif
         updatable_cg_params params = launch_params_buffer.download_first_item();
         DEBUG_REBUILD("Rebuild AR FREE_NODE: ", 2, params.free_node, total_allocation_region_nodes);
         total_nodes_used_from_AR = params.free_node;
@@ -1976,6 +1896,12 @@ public:
         base_entries_count = tree_n; 
         */
 
+#ifdef FLIX_MIXED_REUSE_NODES
+        temp_reuse_list_buffer.resize(partition_count_with_overflow);
+        C2EX
+        temp_reuse_list_buffer.zero();
+        C2EX
+#endif
         setup_bucket_only_build_data<key_type><<<1, 1, 0, 0>>>(
             launch_params_buffer.ptr(),
            
@@ -1987,6 +1913,9 @@ public:
             partition_size,
             node_size,
             reuse_list_buffer.ptr(),
+#ifdef FLIX_MIXED_REUSE_NODES
+            temp_reuse_list_buffer.ptr(),
+#endif
             // copy_offset_list,
             partition_count,
             partition_count_with_overflow,
@@ -2000,9 +1929,6 @@ public:
     // void build(const key_type *keys, size_t keysize, double *build_time_ms, size_t *build_bytes)
     void build_static_tree(const key_type *keys, size_t size, size_t max_size, size_t available_memory_bytes, double *build_time_ms, size_t *build_bytes)
     {
-#ifdef FLIX_MIXED_REUSE_NODES
-        mixed_reuse_initialized = false;
-#endif
         // DEBUG_BUILD_PARAMS("START BUILD: Fill Size", 1, keysize);
         smallsize tile_size = TILE_SIZE;
         smallsize warp_size = WARP_SIZE;
@@ -2100,9 +2026,6 @@ public:
     void rebuild_static_tree(double *build_time_ms, size_t *build_bytes)
     // void rebuild_statictree(const key_type* keys, size_t size, size_t max_size, size_t available_memory_bytes, double* build_time_ms, size_t* build_bytes)
     {
-#ifdef FLIX_MIXED_REUSE_NODES
-        mixed_reuse_initialized = false;
-#endif
         updatable_cg_params params = launch_params_buffer.download_first_item();
         DEBUG_REBUILD("Rebuild AR FREE_NODE: ", 2, params.free_node, total_allocation_region_nodes);
         total_nodes_used_from_AR = params.free_node;
@@ -2170,9 +2093,6 @@ public:
     // void build(const key_type *keys, size_t keysize, double *build_time_ms, size_t *build_bytes)
     void build(const key_type *keys, size_t size, size_t max_size, size_t available_memory_bytes, double *build_time_ms, size_t *build_bytes)
     {
-#ifdef FLIX_MIXED_REUSE_NODES
-        mixed_reuse_initialized = false;
-#endif
         // DEBUG_BUILD_PARAMS("START BUILD: Fill Size", 1, keysize);
         smallsize tile_size = TILE_SIZE;
         smallsize warp_size = WARP_SIZE;
@@ -2267,9 +2187,6 @@ public:
 
     void rebuild(double *build_time_ms, size_t *build_bytes)
     {
-#ifdef FLIX_MIXED_REUSE_NODES
-        mixed_reuse_initialized = false;
-#endif
 
         updatable_cg_params params = launch_params_buffer.download_first_item();
         DEBUG_REBUILD("Rebuild AR FREE_NODE: ", 2, params.free_node, total_allocation_region_nodes);
@@ -2473,8 +2390,11 @@ public:
     // All inserts in a bucket precede its deletes, which precede its lookups.
     void mixed_batch(const key_type *keys, const smallsize *values,
                      const uint8_t *tasks, smallsize *result,
-                     size_t size, cudaStream_t stream)
+                     size_t size, cudaStream_t stream, size_t round_number = 0)
     {
+#ifndef FLIX_MIXED_REUSE_NODES
+        (void)round_number;
+#endif
         if (size == 0)
             return;
         if (size > static_cast<size_t>(std::numeric_limits<smallsize>::max()))
@@ -2482,9 +2402,6 @@ public:
         if (keys == nullptr || tasks == nullptr || result == nullptr)
             throw std::invalid_argument("FliX mixed_batch requires keys, tasks and results");
 
-#ifdef FLIX_MIXED_REUSE_NODES
-        launch_mixed_reuse(keys, values, tasks, result, static_cast<smallsize>(size), stream);
-#else
         constexpr smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
 #ifdef FLIX_MIXED_SINGLE_THREADED
         static_assert(node_size >= 2, "FliX scalar mixed batches require node_size >= 2");
@@ -2496,7 +2413,11 @@ public:
         flix_mixed_batch_kernel_single_threaded<key_type>
             <<<blocks, threads_per_block, 0, stream>>>(
                 launch_params_buffer.ptr(), keys, values, tasks, result,
-                static_cast<smallsize>(size));
+                static_cast<smallsize>(size)
+#ifdef FLIX_MIXED_REUSE_NODES
+                , round_number
+#endif
+                );
 #else
         // Original tiled dispatch preserved verbatim as the default branch.
         static_assert(TILE_SIZE == 16 || TILE_SIZE == 32,
@@ -2513,128 +2434,13 @@ public:
         flix_mixed_batch_kernel_tiled<key_type>
             <<<blocks, threads_per_block, 0, stream>>>(
                 launch_params_buffer.ptr(), keys, values, tasks, result,
-                static_cast<smallsize>(size));
+                static_cast<smallsize>(size)
+#ifdef FLIX_MIXED_REUSE_NODES
+                , round_number
 #endif
-#endif // FLIX_MIXED_REUSE_NODES
-    }
-
-#ifdef MIXED_OPERATION_BATCHES
-    /*
-     * Mixed insert/query and delete/query interfaces.
-     *
-     * These methods are independent of insert(), remove(), lookup(), and
-     * lookups_ordered().  Defining MIXED_OPERATION_BATCHES only adds these two
-     * launch paths; it does not replace or modify any existing kernel.
-     *
-     * The default implementation assigns one cooperative tile to each bucket.
-     * MIXED_BATCH_SINGLE_THREADED reserves the host dispatch points for the
-     * future one-thread-per-bucket variants.
-     */
-    void insert_query_batch(
-        const key_type *encoded_operations,
-        const smallsize *operation_offsets,
-        smallsize *query_results,
-        size_t size,
-        cudaStream_t stream)
-    {
-        if (size == 0)
-            return;
-        if (size > static_cast<size_t>(std::numeric_limits<smallsize>::max()))
-            throw std::invalid_argument(
-                "insert_query_batch operation count exceeds smallsize");
-
-        constexpr smallsize threads_per_block =
-            MAXBLOCKSIZE / DIV_FACTOR;
-
-#ifdef MIXED_BATCH_SINGLE_THREADED
-#pragma message "MIXED INSERT/QUERY: SINGLE-THREADED PATH SELECTED"
-        // Reserved for the later one-thread-per-bucket implementation.  This
-        // name is deliberately distinct from the tiled kernel so enabling the
-        // flag cannot silently run a different algorithm.
-        const smallsize blocks =
-            SDIV(partition_count_with_overflow, threads_per_block);
-        mixed_insert_query_kernel_single_threaded<key_type>
-            <<<blocks, threads_per_block, 0, stream>>>(
-                launch_params_buffer.ptr(),
-                encoded_operations,
-                operation_offsets,
-                query_results,
-                static_cast<smallsize>(size));
-#else
-#pragma message "MIXED INSERT/QUERY: TILED PATH SELECTED"
-        static_assert(
-            static_cast<smallsize>(TILE_SIZE) >= node_size,
-            "Mixed tiled batches require TILE_SIZE >= FliX node_size");
-        static_assert(
-            threads_per_block >= TILE_SIZE,
-            "Mixed tiled batches require at least one tile per block");
-        static_assert(
-            threads_per_block % TILE_SIZE == 0,
-            "Mixed tiled batches require threads/block divisible by TILE_SIZE");
-        const smallsize total_threads =
-            partition_count_with_overflow * TILE_SIZE;
-        const smallsize blocks =
-            SDIV(total_threads, threads_per_block);
-        mixed_insert_query_kernel_tiled<key_type>
-            <<<blocks, threads_per_block, 0, stream>>>(
-                launch_params_buffer.ptr(),
-                encoded_operations,
-                operation_offsets,
-                query_results,
-                static_cast<smallsize>(size));
+                );
 #endif
     }
-
-    void delete_query_batch(
-        const key_type *encoded_operations,
-        smallsize *query_results,
-        size_t size,
-        cudaStream_t stream)
-    {
-        if (size == 0)
-            return;
-        if (size > static_cast<size_t>(std::numeric_limits<smallsize>::max()))
-            throw std::invalid_argument(
-                "delete_query_batch operation count exceeds smallsize");
-
-        constexpr smallsize threads_per_block =
-            MAXBLOCKSIZE / DIV_FACTOR;
-
-#ifdef MIXED_BATCH_SINGLE_THREADED
-#pragma message "MIXED DELETE/QUERY: SINGLE-THREADED PATH SELECTED"
-        // Reserved for the later one-thread-per-bucket implementation.
-        const smallsize blocks =
-            SDIV(partition_count_with_overflow, threads_per_block);
-        mixed_delete_query_kernel_single_threaded<key_type>
-            <<<blocks, threads_per_block, 0, stream>>>(
-                launch_params_buffer.ptr(),
-                encoded_operations,
-                query_results,
-                static_cast<smallsize>(size));
-#else
-#pragma message "MIXED DELETE/QUERY: TILED PATH SELECTED"
-        static_assert(
-            static_cast<smallsize>(TILE_SIZE) >= node_size,
-            "Mixed tiled batches require TILE_SIZE >= FliX node_size");
-        static_assert(
-            threads_per_block >= TILE_SIZE,
-            "Mixed tiled batches require at least one tile per block");
-        static_assert(
-            threads_per_block % TILE_SIZE == 0,
-            "Mixed tiled batches require threads/block divisible by TILE_SIZE");
-        const smallsize total_threads =
-            partition_count_with_overflow * TILE_SIZE;
-        const smallsize blocks =
-            SDIV(total_threads, threads_per_block);
-        mixed_delete_query_kernel_tiled<key_type>
-            <<<blocks, threads_per_block, 0, stream>>>(
-                launch_params_buffer.ptr(),
-                encoded_operations,
-                query_results,
-                static_cast<smallsize>(size));
-#endif
-    }
-#endif
 
     //--------------------- COMBINE INSERT AND DEL ---------------------
     void insert_and_remove(const key_type *update_list, const smallsize *offsets, size_t size, const key_type *delete_list, cudaStream_t stream)
@@ -3126,6 +2932,81 @@ public:
         // todo
     }
 
+
+    // Explicit opt-in API: existing range_lookup_sum() never dispatches here.
+    // Results are 64-bit device values. Recompute after updates on every call;
+    // precomputation, scan, and queries are ordered in the supplied stream.
+    // Like the original range API, calls using this index's scratch buffers
+    // must be serialized, and updates must not overlap these read-only kernels.
+    void range_lookup_sum_prefix(const key_type *lower, const key_type *upper,
+                                 bigsize *result, size_t size, cudaStream_t stream)
+    {
+        if (size == 0)
+            return;
+        if (size > static_cast<size_t>(std::numeric_limits<smallsize>::max()))
+            throw std::invalid_argument("FliX prefix range query count exceeds smallsize");
+        if (lower == nullptr || upper == nullptr || result == nullptr)
+            throw std::invalid_argument("FliX prefix ranges require lower, upper and results");
+        // The reused bucket search has signed-int indices.
+        if (partition_count_with_overflow > static_cast<smallsize>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("FliX prefix bucket count exceeds range-search capacity");
+
+        const auto check_cuda = [](cudaError_t status, const char *operation) {
+            if (status != cudaSuccess)
+                throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+        };
+        const size_t bucket_count = partition_count_with_overflow;
+        if (bucket_count == 0)
+        {
+            check_cuda(cudaMemsetAsync(result, 0, size * sizeof(bigsize), stream),
+                       "Clear empty prefix range results");
+            return;
+        }
+
+        constexpr smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
+        static_assert(threads_per_block >= TILE_SIZE &&
+                      threads_per_block <= MAXBLOCKSIZE && threads_per_block % TILE_SIZE == 0,
+                      "FliX prefix sums require whole tiles per block");
+        if (range_prefix_bucket_sums_buffer.num_elements != bucket_count)
+            range_prefix_bucket_sums_buffer.resize(bucket_count);
+        if (range_prefix_sums_buffer.num_elements != bucket_count + 1)
+            range_prefix_sums_buffer.resize(bucket_count + 1);
+        if (!range_prefix_bucket_sums_buffer.ptr() || !range_prefix_sums_buffer.ptr())
+            throw std::runtime_error("Failed to allocate FliX 64-bit range-prefix buffers");
+
+        // Inclusive scan into prefix + 1 produces an exclusive B+1 layout.
+        // Query storage requirements before launch; retain scratch for reuse.
+        size_t scan_bytes = 0;
+        check_cuda(cub::DeviceScan::InclusiveSum(
+                       nullptr, scan_bytes, range_prefix_bucket_sums_buffer.ptr(),
+                       range_prefix_sums_buffer.ptr() + 1, static_cast<int>(bucket_count), stream),
+                   "Size FliX range-prefix scan storage");
+        if (range_prefix_scan_storage_buffer.num_elements < std::max(scan_bytes, size_t{1}))
+            range_prefix_scan_storage_buffer.resize(std::max(scan_bytes, size_t{1}));
+        if (!range_prefix_scan_storage_buffer.ptr())
+            throw std::runtime_error("Failed to allocate FliX range-prefix scan storage");
+
+        constexpr size_t tiles_per_block = threads_per_block / TILE_SIZE;
+        const size_t bucket_blocks = (bucket_count + tiles_per_block - 1) / tiles_per_block;
+        precompute_bucket_offset_sums_u64_kernel<key_type>
+            <<<bucket_blocks, threads_per_block, 0, stream>>>(
+                launch_params_buffer.ptr(), range_prefix_bucket_sums_buffer.ptr());
+        check_cuda(cudaGetLastError(), "Launch FliX 64-bit bucket sums");
+        check_cuda(cudaMemsetAsync(range_prefix_sums_buffer.ptr(), 0, sizeof(bigsize), stream),
+                   "Initialize FliX prefix leading zero");
+        check_cuda(cub::DeviceScan::InclusiveSum(
+                       range_prefix_scan_storage_buffer.ptr(), scan_bytes,
+                       range_prefix_bucket_sums_buffer.ptr(), range_prefix_sums_buffer.ptr() + 1,
+                       static_cast<int>(bucket_count), stream),
+                   "Compute FliX range-prefix sums");
+
+        const size_t query_blocks = (size + threads_per_block - 1) / threads_per_block;
+        lookup_kernel_range_prefix_sums<key_type>
+            <<<query_blocks, threads_per_block, 0, stream>>>(
+                launch_params_buffer.ptr(), lower, upper, range_prefix_sums_buffer.ptr(),
+                result, static_cast<smallsize>(size));
+        check_cuda(cudaGetLastError(), "Launch FliX prefix range queries");
+    }
 
     void lookups_successor(const key_type *keys, key_type *result, size_t size, cudaStream_t stream)
     {

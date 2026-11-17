@@ -42,6 +42,10 @@ struct updatable_coarse_granular_launch_parameters {
     smallsize allocation_buffer_count;
     smallsize* reuse_list; //support compaction and reuse of nodes
     smallsize reuse_list_count;
+#ifdef FLIX_MIXED_REUSE_NODES
+    smallsize* temp_reuse_list;
+    smallsize temp_reuse_count;
+#endif
 
     bool long_keys;
     bool aggregate_results;
