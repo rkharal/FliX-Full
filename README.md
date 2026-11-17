@@ -8,8 +8,8 @@ FliX is a high-performance GPU-resident indexing structure designed to support h
 ## Authors
 
 * **Rosina Kharal** — University of Waterloo, Canada
-* **Justus Henneberg** — Johannes Gutenberg University of Mainz, Germany
 * **Trevor Brown** — University of Waterloo, Canada
+* **Justus Henneberg** — Johannes Gutenberg University of Mainz, Germany
 * **Felix Schuhknecht** — Johannes Gutenberg University of  Mainz, Germany
 
 ## Previous Work

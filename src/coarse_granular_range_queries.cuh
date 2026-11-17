@@ -1,3 +1,11 @@
+// =============================================================================
+// File: coarse_granular_range_queries.cuh
+// Author: Rosina Kharal, Trevor Brown
+// Description: Range query kernels in FliX
+// Copyright (c) 2025 Justus Henneberg, Rosina Kharal
+// SPDX-License-Identifier: GPL-3.0-or-later
+// =============================================================================
+
 // file: ordered_range_lookup.cuh
 #ifndef COARSE_GRANULAR_RANGE_QUERIES_CUH
 #define COARSE_GRANULAR_RANGE_QUERIES_CUH
