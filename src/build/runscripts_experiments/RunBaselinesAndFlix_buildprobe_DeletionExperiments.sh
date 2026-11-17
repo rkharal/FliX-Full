@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # actual experiment and file generation occurs here
 set -u -o pipefail
-cd ..
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 # ------------------ Args ------------------
 if [[ $# -ne 7 ]]; then

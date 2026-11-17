@@ -5,10 +5,10 @@
 set -u -o pipefail
 
 # ---- Config ---- Normal Script
-BASELINE_SCRIPT="./RunBaselinesAndFlix_buildprobe.sh"   # must accept 7 positional args:
+BASELINE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/RunBaselinesAndFlix_buildprobe.sh"   # must accept 7 positional args:
 
 #DEL SCRIPT
-#BASELINE_SCRIPT="./RunBaselinesAndFlix_buildprobe_DELs.sh"   # must accept 7 positional args:
+#BASELINE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/RunBaselinesAndFlix_buildprobe_DELs.sh"   # must accept 7 positional args:
 
 #   X Y GrowthVal NodeSizeInput CachelineSizeInput BuildSize ProbeSize
 #GrowthVal=200

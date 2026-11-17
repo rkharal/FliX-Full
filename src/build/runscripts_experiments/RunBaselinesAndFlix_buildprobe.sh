@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # file: RunBaselines_Only_withSizes.sh
 set -u -o pipefail
-cd ..
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 # ------------------ Args ------------------
 if [[ $# -ne 7 ]]; then

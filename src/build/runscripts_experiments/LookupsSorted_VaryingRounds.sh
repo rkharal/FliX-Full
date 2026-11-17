@@ -4,7 +4,7 @@
 # Runs full experiment + plotting for each DIV in {1,2,4,8}
 #------------------------------------------------------------
 set -u -o pipefail
-cd ..
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 if [[ $# -ne 7 ]]; then
   echo "Usage: $0 Xval Yval GrowthVal NodeSizeInput CachelineSizeInput BuildSize ProbeSize" >&2
@@ -197,3 +197,7 @@ if false; then
   CSV_FILES+=("${TARGET_DIR}/${OUT_CSV}")
   echo "Rebuild every 8 Execution done completed ."
 fi 
+
+# Close the DIV and round sweeps.
+done
+done

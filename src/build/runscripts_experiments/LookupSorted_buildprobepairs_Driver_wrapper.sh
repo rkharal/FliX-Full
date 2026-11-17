@@ -4,7 +4,7 @@
 set -u -o pipefail
 
 # ---- Target (must accept 7 args: X Y Growth Node Cacheline Build Probe) ----
-BASELINE_SCRIPT="./LookupsSorted_VaryingRounds.sh"
+BASELINE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/LookupsSorted_VaryingRounds.sh"
 
 # ---- Global params ----
 GrowthVal=100

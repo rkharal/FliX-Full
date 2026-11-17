@@ -62,5 +62,4 @@ backup*/
 # ignore these entirely
 KEEP_benchmarks_updates/
 backup*/
-build/
 /concurrent/
