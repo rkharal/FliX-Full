@@ -81,6 +81,10 @@ To reproduce the experimental results from the paper:
 
 > **Note:** Plotting scripts and additional run configurations are currently being integrated into the repository. Please check back for updates as we finalize the repo.
 
+## Contact
+
+Questions/Comments: contact rkharal@uwaterloo.ca
+
 ## License and Attribution
 
 ```cpp
