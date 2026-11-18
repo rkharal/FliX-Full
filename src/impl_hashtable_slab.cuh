@@ -1,7 +1,9 @@
 // =============================================================================
 // File: impl_hashtable_slab.cuh
-// Author: Justus Henneberg
-// Description: Implements impl_hashtable_slab     
+// Author: Justus Henneberg, Rosina Kharal
+// Description: Hash_Slab (SlabHash) baseline for the FliX benchmarks. Implemented based on the
+//              original work by the original authors: Ashkiani et al., "A Dynamic Hash Table
+//              for the GPU" (see the Benchmarked Data Structures table in README.md).
 // Copyright (c) 2025 Justus Henneberg, Rosina Kharal
 // SPDX-License-Identifier: GPL-3.0-or-later
 // =============================================================================

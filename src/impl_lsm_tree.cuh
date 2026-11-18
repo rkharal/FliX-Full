@@ -1,7 +1,10 @@
 // =============================================================================
 // File: impl_lsm_tree.cuh
-// Author: Justus Henneberg
-// Description: Implements impl_lsm_tree     
+// Author: Justus Henneberg, Rosina Kharal, Trevor Brown
+// Description: LSMu (GPU LSM) baseline for the FliX benchmarks. Implemented based on the
+//              original work by the original authors: Ashkiani et al., "GPU LSM: A Dynamic
+//              Dictionary Data Structure for the GPU" (see the Benchmarked Data Structures
+//              table in README.md).
 // Copyright (c) 2025 Justus Henneberg, Rosina Kharal
 // SPDX-License-Identifier: GPL-3.0-or-later
 // =============================================================================

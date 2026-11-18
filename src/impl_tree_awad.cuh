@@ -1,7 +1,9 @@
 // =============================================================================
 // File: impl_tree_awad.cuh
-// Author: Justus Henneberg
-// Description: Implements impl_tree_awad     
+// Author: Justus Henneberg, Rosina Kharal, Trevor Brown
+// Description: GPU B-Tree baseline for the FliX benchmarks. Implemented based on the original
+//              work by the original authors: Awad et al., "Engineering a High-Performance GPU
+//              B-Tree" (see the Benchmarked Data Structures table in README.md).
 // Copyright (c) 2025 Justus Henneberg, Rosina Kharal
 // SPDX-License-Identifier: GPL-3.0-or-later
 // =============================================================================

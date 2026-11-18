@@ -56,6 +56,7 @@ If you use these baselines in your research, please cite the original publicatio
 | **GPU-BTree** | Awad et al., *Engineering a High-Performance GPU B-Tree* | [DOI](https://dl.acm.org/doi/10.1145/3293883.3295706) |
 | **Hash_Slab** | Ashkiani et al., *A Dynamic Hash Table for the GPU* | [DOI](https://doi.org/10.1109/IPDPS.2018.00052) |
 | **Hash_Warpcore** | Jünger et al., *WarpCore: A Library for Fast Hash Tables on GPUs* | [DOI](https://ieeexplore.ieee.org/document/9406635) |
+| **RTScan** | Lv et al., *RTScan: Efficient Scan with Ray Tracing Cores* | [PDF](https://www.vldb.org/pvldb/vol17/p1460-lv.pdf) |
 
 ## Installation Requirements
 
